@@ -1,0 +1,16 @@
+# Manager runtime and recovery data
+config.json
+config.previous.json
+token.dat
+status.json
+status.corrupt-*.json
+run.lock
+logs/
+*.tmp
+# Editor and OS temporary files
+.vscode/
+.idea/
+*~
+*.swp
+.DS_Store
+Thumbs.db
