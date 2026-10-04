@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$ScriptVersion = '1.1.0'
+$ScriptVersion = '1.2.0'
 $Root = Join-Path $env:ProgramData 'DuckDNS'
 $InstalledScript = Join-Path $Root 'DuckDNS-Manager.ps1'
 $ConfigPath = Join-Path $Root 'config.json'
@@ -20,6 +20,7 @@ $script:RunClock = $null
 $InternalLimitSeconds = 240
 $ManualFallbacks = @('1.1.1.1', '8.8.8.8')
 $TokenPath = Join-Path $Root 'token.dat'
+$CredentialReceiptPath = Join-Path $Root 'credentials.dat'
 $StatusPath = Join-Path $Root 'status.json'
 $LockPath = Join-Path $Root 'run.lock'
 $LogDirectory = Join-Path $Root 'logs'
@@ -30,8 +31,9 @@ $ExitCodes = @{ Success = 0; Config = 10; Token = 11; PublicIp = 12; Dns = 13; A
 
 function New-DefaultConfig {
     return [pscustomobject]@{
-        SchemaVersion = 2
-        Domain = ''
+        SchemaVersion = 3
+        Hostname = ''
+        NetworkInterface = [pscustomobject]@{ Mode = 'Automatic'; InterfaceGuid = $null }
         CompareIpBeforeUpdate = $true
         PostUpdateValidation = $true
         Dns = [pscustomobject]@{ Mode = 'System'; ManualServer = $null }
@@ -49,6 +51,10 @@ function New-DefaultConfig {
 function New-EmptyState {
     return [pscustomobject]@{
         Domain = $null
+        CredentialStatus = 'Pending'
+        CredentialHostname = $null
+        CredentialVerificationId = $null
+        LastCredentialVerificationUtc = $null
         LastCheckUtc = $null
         LastSuccessfulCheckUtc = $null
         ConsecutiveFailures = 0
@@ -86,12 +92,17 @@ function Test-IPv4([string]$Value, [bool]$RequirePublic = $false) {
     return $true
 }
 
-function Normalize-Domain([string]$Value) {
+function Normalize-Hostname([string]$Value) {
     $name = $Value.Trim().ToLowerInvariant()
     if ($name.EndsWith('.duckdns.org')) { $name = $name.Substring(0, $name.Length - 12) }
-    if ($name -notmatch '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$') { throw 'Invalid DuckDNS domain.' }
-    return ($name + '.duckdns.org')
+    if ($name -notmatch '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$') { throw 'Invalid DuckDNS hostname.' }
+    return $name
 }
+
+function Get-DuckDnsDomain($Config) { return ([string]$Config.Hostname + '.duckdns.org') }
+
+# Legacy config/state validation only. Canonical configuration stores Hostname.
+function Normalize-Domain([string]$Value) { return ((Normalize-Hostname $Value) + '.duckdns.org') }
 
 function Assert-Range($Value, [int]$Minimum, [int]$Maximum, [string]$Name) {
     if ($Value -is [bool] -or $Value -isnot [int] -and $Value -isnot [long]) { throw "Invalid $Name." }
@@ -99,8 +110,21 @@ function Assert-Range($Value, [int]$Minimum, [int]$Maximum, [string]$Name) {
 }
 
 function Assert-Config($Config) {
-    if ($null -eq $Config -or $Config.SchemaVersion -notin @(1, 2)) { throw 'Unsupported configuration schema.' }
-    if ((Normalize-Domain ([string]$Config.Domain)) -cne [string]$Config.Domain) { throw 'Invalid domain.' }
+    if ($null -eq $Config -or ($Config.SchemaVersion -isnot [int] -and $Config.SchemaVersion -isnot [long]) -or
+        $Config.SchemaVersion -notin @(1, 2, 3)) { throw 'Unsupported configuration schema.' }
+    if ($Config.SchemaVersion -eq 3) {
+        if ($Config.Hostname -isnot [string] -or (Normalize-Hostname ([string]$Config.Hostname)) -cne [string]$Config.Hostname -or
+            $Config.PSObject.Properties['Domain']) { throw 'Invalid hostname configuration.' }
+        if ($Config.NetworkInterface -isnot [pscustomobject] -or $Config.NetworkInterface.Mode -cnotin @('Automatic','Specific')) { throw 'Invalid interface mode.' }
+        if ($Config.NetworkInterface.Mode -eq 'Automatic') {
+            if ($null -ne $Config.NetworkInterface.InterfaceGuid) { throw 'Invalid automatic interface.' }
+        } else {
+            $id = [guid]::Empty
+            if ($Config.NetworkInterface.InterfaceGuid -isnot [string] -or
+                -not [guid]::TryParse([string]$Config.NetworkInterface.InterfaceGuid, [ref]$id) -or
+                $id -eq [guid]::Empty) { throw 'Invalid interface identity.' }
+        }
+    } elseif ((Normalize-Domain ([string]$Config.Domain)) -cne [string]$Config.Domain) { throw 'Invalid domain.' }
     if ($Config.SchemaVersion -eq 1) {
         if (-not (Test-IPv4 ([string]$Config.ValidationDns))) { throw 'Invalid validation DNS.' }
     } else {
@@ -119,14 +143,21 @@ function Assert-Config($Config) {
     Assert-Range $Config.Scheduling.Periodic.IntervalMinutes 5 1440 'periodic interval'
 }
 
-function Convert-ConfigV2($Value) {
+function Convert-ConfigV3($Value) {
     Assert-Config $Value
     if ($Value.SchemaVersion -eq 1) {
         $mode = 'System'; $manual = $null
         if ($Value.ValidationDns -ne '1.1.1.1') { $mode = 'Manual'; $manual = $Value.ValidationDns }
         $Value.PSObject.Properties.Remove('ValidationDns')
         $Value | Add-Member -NotePropertyName Dns -NotePropertyValue ([pscustomobject]@{ Mode = $mode; ManualServer = $manual })
-        $Value.SchemaVersion = 2
+    }
+    if ($Value.SchemaVersion -lt 3) {
+        $hostname = Normalize-Hostname $Value.Domain
+        $Value.PSObject.Properties.Remove('Domain')
+        $Value | Add-Member -NotePropertyName Hostname -NotePropertyValue $hostname
+        $Value | Add-Member -NotePropertyName NetworkInterface -NotePropertyValue ([pscustomobject]@{
+            Mode = 'Automatic'; InterfaceGuid = $null })
+        $Value.SchemaVersion = 3
     }
     Assert-Config $Value
     return $Value
@@ -134,7 +165,7 @@ function Convert-ConfigV2($Value) {
 
 function Read-Config {
     $value = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    return (Convert-ConfigV2 $value)
+    return (Convert-ConfigV3 $value)
 }
 
 function Save-Config($Value) {
@@ -154,7 +185,7 @@ function Migrate-Config {
     if (-not $script:RunLockHeld) { throw 'Migration requires lock.' }
     $old = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-Config $old
-    if ($old.SchemaVersion -eq 1) { Save-Config (Convert-ConfigV2 $old) }
+    if ($old.SchemaVersion -lt 3) { Save-Config (Convert-ConfigV3 $old) }
 }
 
 function Assert-State($Value) {
@@ -163,12 +194,24 @@ function Assert-State($Value) {
             'LastDetectedPublicIPv4','DuckDnsIPv4','SynchronizationState','LastExitCode')) {
         if ($null -eq $Value.PSObject.Properties[$name]) { throw 'Invalid state structure.' }
     }
-    foreach ($name in @('Domain','LastReason','LastResult','DuckDnsIPv4','ApplicationVersion','LastStateRecoveryReason')) {
+    foreach ($name in @('Domain','LastReason','LastResult','DuckDnsIPv4','ApplicationVersion','LastStateRecoveryReason','CredentialHostname','CredentialVerificationId')) {
         if ($null -ne $Value.$name -and $Value.$name -isnot [string]) { throw 'Invalid state text.' }
     }
     if ($Value.Domain -and (Normalize-Domain ([string]$Value.Domain)) -cne $Value.Domain) { throw 'Invalid state domain.' }
+    if ($Value.PSObject.Properties['CredentialStatus'] -and $Value.CredentialStatus -cnotin @('Pending','Verified','Rejected')) {
+        throw 'Invalid credential status.'
+    }
+    if ($Value.CredentialHostname -and (Normalize-Hostname $Value.CredentialHostname) -cne $Value.CredentialHostname) {
+        throw 'Invalid credential hostname.'
+    }
+    if ($Value.CredentialVerificationId) {
+        $id = [guid]::Empty
+        if (-not [guid]::TryParse($Value.CredentialVerificationId, [ref]$id) -or $id -eq [guid]::Empty) {
+            throw 'Invalid credential verification identity.'
+        }
+    }
     if ($Value.SynchronizationState -cnotin @('Unknown','Synchronized','Pending','Accepted','Failed')) { throw 'Invalid state status.' }
-    foreach ($name in @('LastCheckUtc','LastSuccessfulUpdateUtc','LastSuccessfulCheckUtc','LastStateRecoveryUtc')) {
+    foreach ($name in @('LastCheckUtc','LastSuccessfulUpdateUtc','LastSuccessfulCheckUtc','LastStateRecoveryUtc','LastCredentialVerificationUtc')) {
         $v = $Value.$name
         if ($v) {
             if ($v -is [DateTime]) { continue }
@@ -295,7 +338,7 @@ function Protect-Runtime {
     Set-SecureAcl $Root $true
     if (-not (Test-Path -LiteralPath $LogDirectory -PathType Container)) { [void][IO.Directory]::CreateDirectory($LogDirectory) }
     Set-SecureAcl $LogDirectory $true
-    foreach ($path in @($InstalledScript, $ConfigPath, $PreviousConfigPath, $TokenPath, $StatusPath, $LockPath)) {
+    foreach ($path in @($InstalledScript, $ConfigPath, $PreviousConfigPath, $TokenPath, $CredentialReceiptPath, $StatusPath, $LockPath)) {
         if (Test-Path -LiteralPath $path -PathType Leaf) { Set-SecureAcl $path $false }
     }
     foreach ($file in @(Get-CorruptStateFiles)) { Set-SecureAcl $file.FullName $false }
@@ -339,6 +382,72 @@ function Test-TokenLocal {
     try { $token = Read-Token; return (-not [string]::IsNullOrWhiteSpace($token)) }
     catch { return $false }
     finally { $token = $null }
+}
+
+function Get-TokenFileIdentity {
+    $cipher = [IO.File]::ReadAllBytes($TokenPath)
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try { return [Convert]::ToBase64String($hash.ComputeHash($cipher)) }
+    finally { $hash.Dispose(); [Array]::Clear($cipher, 0, $cipher.Length) }
+}
+
+function Write-CredentialReceipt($Value) {
+    if (-not $script:RunLockHeld) { throw 'Credential receipt write requires lock.' }
+    $bytes = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $Value -Compress))
+    try {
+        $cipher = [Security.Cryptography.ProtectedData]::Protect($bytes, $null,
+            [Security.Cryptography.DataProtectionScope]::LocalMachine)
+        try { Write-AtomicBytes $CredentialReceiptPath $cipher }
+        finally { [Array]::Clear($cipher, 0, $cipher.Length) }
+    } finally { [Array]::Clear($bytes, 0, $bytes.Length) }
+}
+
+function Read-CredentialReceipt {
+    $cipher = [IO.File]::ReadAllBytes($CredentialReceiptPath)
+    $bytes = [Security.Cryptography.ProtectedData]::Unprotect($cipher, $null,
+        [Security.Cryptography.DataProtectionScope]::LocalMachine)
+    try { return (ConvertFrom-Json ([Text.Encoding]::UTF8.GetString($bytes))) }
+    finally { [Array]::Clear($bytes, 0, $bytes.Length); [Array]::Clear($cipher, 0, $cipher.Length) }
+}
+
+function Reset-CredentialVerification($State) {
+    $State.CredentialStatus = 'Pending'; $State.CredentialHostname = $null
+    $State.CredentialVerificationId = $null; $State.LastCredentialVerificationUtc = $null
+}
+
+function Get-CredentialsStatus($Config, $State) {
+    if (-not (Test-TokenLocal)) { return '[FAIL] Unavailable' }
+    try {
+        $receipt = Read-CredentialReceipt
+        if (-not $State.CredentialVerificationId -or $State.CredentialHostname -cne $Config.Hostname -or
+            $receipt.Id -cne $State.CredentialVerificationId -or $receipt.Hostname -cne $Config.Hostname -or
+            $receipt.TokenIdentity -cne (Get-TokenFileIdentity) -or $receipt.Status -cne $State.CredentialStatus) {
+            return '[WARN] Protected; verification pending'
+        }
+        if ($State.CredentialStatus -eq 'Verified' -and $State.LastCredentialVerificationUtc) {
+            return '[OK] Protected and verified'
+        }
+        if ($State.CredentialStatus -eq 'Rejected') { return '[FAIL] Rejected' }
+    } catch { }
+    return '[WARN] Protected; verification pending'
+}
+
+function Set-CredentialOutcome($Config, $State, $Api) {
+    if ($Api.Kind -notin @('Success','Rejected')) { return }
+    # The opaque receipt ID is public state; the ciphertext identity stays DPAPI-protected.
+    # A changed hostname/token, unreadable receipt or partial write always becomes pending.
+    Reset-CredentialVerification $State
+    try {
+        $identity = Get-TokenFileIdentity
+        if ($identity -cne $Api.TokenIdentity) { return }
+        $id = [guid]::NewGuid().ToString('D')
+        $status = 'Rejected'; $verified = $null
+        if ($Api.Kind -eq 'Success') { $status = 'Verified'; $verified = [DateTime]::UtcNow.ToString('o') }
+        Write-CredentialReceipt ([pscustomobject]@{ Id = $id; Hostname = $Config.Hostname;
+            TokenIdentity = $identity; Status = $status })
+        $State.CredentialStatus = $status; $State.CredentialHostname = $Config.Hostname
+        $State.CredentialVerificationId = $id; $State.LastCredentialVerificationUtc = $verified
+    } catch { Reset-CredentialVerification $State }
 }
 
 function Enter-RunLock {
@@ -472,33 +581,198 @@ function Write-AppLog($Config, [string]$ReasonName, [string]$Result, [int]$ExitC
     } catch { }
 }
 
-function Invoke-Provider([string]$Url) {
+function Initialize-BoundHttp {
+    if ('DuckDns.Native.BoundHttp' -as [type]) { return }
+    # Native delegate: network callbacks have no PowerShell runspace.
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+namespace DuckDns.Native {
+    public sealed class SourceBinding {
+        private readonly IPAddress source;
+        public SourceBinding(string address) {
+            source = IPAddress.Parse(address);
+            if (source.AddressFamily != AddressFamily.InterNetwork)
+                throw new ArgumentException("IPv4 source required.");
+        }
+        public IPEndPoint Bind(ServicePoint point, IPEndPoint remote, int retry) {
+            if (remote.AddressFamily != AddressFamily.InterNetwork || retry > 2)
+                throw new InvalidOperationException("IPv4 binding unavailable.");
+            return new IPEndPoint(source, 0);
+        }
+    }
+    public static class BoundHttp {
+        public static string Get(string url, string source, int timeout) {
+            HttpWebRequest request = (HttpWebRequest)WebRequest.Create(url);
+            request.Proxy = null;
+            request.AllowAutoRedirect = false;
+            request.KeepAlive = false;
+            request.Timeout = timeout;
+            request.ReadWriteTimeout = timeout;
+            request.ConnectionGroupName = "DuckDns-" + Guid.NewGuid().ToString("N");
+            ServicePoint point = request.ServicePoint;
+            SourceBinding binding = new SourceBinding(source);
+            lock (point) {
+                BindIPEndPoint previous = point.BindIPEndPointDelegate;
+                HttpWebResponse response = null;
+                try {
+                    point.BindIPEndPointDelegate = binding.Bind;
+                    response = (HttpWebResponse)request.GetResponse();
+                    if (response.StatusCode != HttpStatusCode.OK)
+                        throw new InvalidOperationException("Provider response unavailable.");
+                    using (Stream stream = response.GetResponseStream()) {
+                        byte[] data = new byte[129];
+                        int count = 0;
+                        while (count < data.Length) {
+                            int read = stream.Read(data, count, data.Length - count);
+                            if (read == 0) break;
+                            count += read;
+                        }
+                        if (count > 128) throw new InvalidOperationException("Provider response invalid.");
+                        return Encoding.ASCII.GetString(data, 0, count);
+                    }
+                } finally {
+                    // Restoration must run even if response disposal or abort fails.
+                    try { if (response != null) response.Close(); }
+                    finally {
+                        try { request.Abort(); }
+                        finally {
+                            try { point.CloseConnectionGroup(request.ConnectionGroupName); }
+                            finally { point.BindIPEndPointDelegate = previous; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+'@ -IgnoreWarnings -ErrorAction Stop
+}
+
+function Test-UsableLocalIPv4([string]$Value) {
+    if (-not (Test-IPv4 $Value)) { return $false }
+    $n = [Net.IPAddress]::Parse($Value).GetAddressBytes()
+    return ($n[0] -ne 0 -and $n[0] -ne 127 -and $n[0] -lt 224 -and
+        -not ($n[0] -eq 169 -and $n[1] -eq 254))
+}
+
+function Get-UsableInterfaces {
+    # .NET inventory also includes usable PPP/tunnel adapters. Never filter by name.
+    $adapters = @()
+    try { $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop) } catch { }
+    $result = @()
+    foreach ($network in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+        if ($network.OperationalStatus -ne [Net.NetworkInformation.OperationalStatus]::Up) { continue }
+        $id = [guid]::Empty
+        if (-not [guid]::TryParse($network.Id, [ref]$id) -or $id -eq [guid]::Empty) { continue }
+        try {
+            $index = $network.GetIPProperties().GetIPv4Properties().Index
+            $addresses = @(Get-NetIPAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction Stop |
+                Where-Object { [string]$_.AddressState -eq 'Preferred' -and -not $_.SkipAsSource -and
+                    (Test-UsableLocalIPv4 ([string]$_.IPAddress)) } |
+                Sort-Object IPAddress | ForEach-Object { [string]$_.IPAddress } | Select-Object -Unique)
+            if (-not $addresses.Count) { continue }
+            $adapter = @($adapters | Where-Object { [string]$_.InterfaceGuid -and
+                ([guid]$_.InterfaceGuid) -eq $id } | Select-Object -First 1)
+            $virtual = ($network.NetworkInterfaceType -in @([Net.NetworkInformation.NetworkInterfaceType]::Tunnel,
+                [Net.NetworkInformation.NetworkInterfaceType]::Ppp))
+            if ($adapter.Count -and ($adapter[0].Virtual -eq $true -or $adapter[0].HardwareInterface -eq $false)) { $virtual = $true }
+            $result += [pscustomobject]@{ InterfaceGuid = $id.ToString('D'); InterfaceAlias = $network.Name;
+                InterfaceIndex = $index; IPv4 = $addresses[0]; Addresses = $addresses; IsVirtual = $virtual }
+        } catch { continue }
+    }
+    return @($result | Sort-Object InterfaceAlias, InterfaceGuid)
+}
+
+function Get-PublicIpContext($Config) {
+    if ($Config.NetworkInterface.Mode -eq 'Automatic') {
+        return [pscustomobject]@{ Mode = 'Automatic'; Available = $true; InterfaceGuid = $null;
+            InterfaceAlias = $null; InterfaceIndex = $null; IPv4 = $null }
+    }
+    $id = [guid]$Config.NetworkInterface.InterfaceGuid
+    $selected = @()
+    try { $selected = @(Get-UsableInterfaces | Where-Object { ([guid]$_.InterfaceGuid) -eq $id } | Select-Object -First 1) } catch { }
+    if (-not $selected.Count) {
+        return [pscustomobject]@{ Mode = 'Specific'; Available = $false; InterfaceGuid = $id.ToString('D');
+            InterfaceAlias = $null; InterfaceIndex = $null; IPv4 = $null }
+    }
+    return [pscustomobject]@{ Mode = 'Specific'; Available = $true; InterfaceGuid = $id.ToString('D');
+        InterfaceAlias = $selected[0].InterfaceAlias; InterfaceIndex = $selected[0].InterfaceIndex; IPv4 = $selected[0].IPv4 }
+}
+
+function Test-PublicIpContext($Context) {
+    if ($Context.Mode -eq 'Automatic') { return $true }
+    if (-not $Context.Available) { return $false }
+    $current = @()
+    try { $current = @(Get-UsableInterfaces | Where-Object { ([guid]$_.InterfaceGuid) -eq ([guid]$Context.InterfaceGuid) }) } catch { return $false }
+    return ($current.Count -eq 1 -and $current[0].InterfaceIndex -eq $Context.InterfaceIndex -and
+        $Context.IPv4 -in $current[0].Addresses)
+}
+
+function Invoke-BoundProvider([string]$Url, [string]$SourceIPv4) {
+    Initialize-BoundHttp
+    return [DuckDns.Native.BoundHttp]::Get($Url, $SourceIPv4, 8000)
+}
+
+function New-InterfaceUnavailableException {
+    $failure = [InvalidOperationException]::new('Selected interface unavailable.')
+    $failure.Data['DuckDnsInterfaceUnavailable'] = $true
+    return $failure
+}
+
+function Test-InterfaceUnavailableException($ErrorRecord) {
+    $failure = $ErrorRecord.Exception
+    while ($null -ne $failure) {
+        if ($failure.Data['DuckDnsInterfaceUnavailable']) { return $true }
+        $failure = $failure.InnerException
+    }
+    return $false
+}
+
+function Invoke-Provider([string]$Url, $Context) {
     Assert-Deadline 16
+    # Context is mandatory. Specific must never reach the automatic request path.
+    if ($null -eq $Context -or -not (Test-PublicIpContext $Context)) { throw (New-InterfaceUnavailableException) }
     try {
-        $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
+        if ($Context.Mode -eq 'Specific') { $content = Invoke-BoundProvider $Url $Context.IPv4 }
+        else { $content = (Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop).Content }
         Assert-Deadline
-        $ip = ([string]$response.Content).Trim()
+        # Drop a response if the selected source ceased to be usable during the call.
+        if (-not (Test-PublicIpContext $Context)) { throw (New-InterfaceUnavailableException) }
+        $ip = ([string]$content).Trim()
         if (Test-IPv4 $ip $true) { return $ip }
     } catch [TimeoutException] { throw }
-    catch { }
+    catch { if (Test-InterfaceUnavailableException $_) { throw } }
     Assert-Deadline
     return $null
 }
 
+function New-PublicIpResult($IP, $Results, $Context, [bool]$Unavailable = $false) {
+    return [pscustomobject]@{ IP = $IP; Results = @($Results); Context = $Context; InterfaceUnavailable = $Unavailable }
+}
+
 function Find-PublicIPv4($Config, [bool]$AllProviders = $false) {
-    $results = @()
+    $results = @(); $context = Get-PublicIpContext $Config
+    if (-not $context.Available) { return (New-PublicIpResult $null $results $context $true) }
     for ($attempt = 1; $attempt -le [int]$Config.Retry.Attempts; $attempt++) {
         foreach ($provider in $Providers) {
-            $ip = Invoke-Provider $provider
+            try { $ip = Invoke-Provider $provider $context }
+            catch {
+                if (Test-InterfaceUnavailableException $_) { return (New-PublicIpResult $null $results $context $true) }
+                throw
+            }
             $results += [pscustomobject]@{ Provider = ([uri]$provider).Host; IP = $ip }
-            if ($ip -and -not $AllProviders) { return [pscustomobject]@{ IP = $ip; Results = $results } }
+            if ($ip -and -not $AllProviders) { return (New-PublicIpResult $ip $results $context) }
         }
         if ($AllProviders) { break }
         if ($attempt -lt [int]$Config.Retry.Attempts) { Wait-Retry ([int]$Config.Retry.DelaySeconds) }
     }
     $first = @($results | Where-Object { $_.IP } | Select-Object -First 1)
-    if ($first.Count) { return [pscustomobject]@{ IP = $first[0].IP; Results = $results } }
-    return [pscustomobject]@{ IP = $null; Results = $results }
+    if ($first.Count) { return (New-PublicIpResult $first[0].IP $results $context) }
+    return (New-PublicIpResult $null $results $context)
 }
 
 function Get-ResolverChain($Config) {
@@ -537,7 +811,7 @@ function Resolve-HostA($Config, [bool]$Retry = $true, [bool]$TestChain = $false)
     $chain = @(Get-ResolverChain $Config)
     for ($attempt = 1; $attempt -le $count; $attempt++) {
         foreach ($server in $chain) {
-            $query = Invoke-DnsQuery $Config.Domain $server
+            $query = Invoke-DnsQuery (Get-DuckDnsDomain $Config) $server
             $results += [pscustomobject]@{ Server = $server; Success = $query.Success; Addresses = $query.Addresses }
             if ($query.Success) {
                 if ($null -eq $chosen) {
@@ -570,25 +844,41 @@ function Get-ProviderConsensus($Results) {
 }
 
 function Confirm-PublicIPv4($Config, $Found) {
-    $results = @($Found.Results)
+    $results = @($Found.Results); $context = $Found.Context
+    if ($null -eq $context -or -not (Test-PublicIpContext $context) -or
+        $context.Mode -cne $Config.NetworkInterface.Mode -or ($context.Mode -eq 'Specific' -and
+        ([guid]$context.InterfaceGuid) -ne ([guid]$Config.NetworkInterface.InterfaceGuid))) {
+        return (New-PublicIpResult $null $results $context $true)
+    }
     foreach ($provider in $Providers) {
         $hostName = ([uri]$provider).Host
         if (@($results | Where-Object { $_.Provider -eq $hostName -and $_.IP }).Count) { continue }
-        $ip = Invoke-Provider $provider
+        try { $ip = Invoke-Provider $provider $context }
+        catch {
+            if (Test-InterfaceUnavailableException $_) { return (New-PublicIpResult $null $results $context $true) }
+            throw
+        }
         $results += [pscustomobject]@{ Provider = $hostName; IP = $ip }
         $consensus = Get-ProviderConsensus $results
-        if ($consensus) { return [pscustomobject]@{ IP = $consensus; Results = $results } }
+        if ($consensus) { return (New-PublicIpResult $consensus $results $context) }
     }
-    return [pscustomobject]@{ IP = (Get-ProviderConsensus $results); Results = $results }
+    return (New-PublicIpResult (Get-ProviderConsensus $results) $results $context)
+}
+
+function Get-InterfaceFailureRows {
+    return @((New-Line 'Network interface' '[FAIL] Selected interface unavailable'),
+        (New-Line 'Public IPv4' '[FAIL] Could not query selected interface'),
+        (New-Line 'DuckDNS API' '[SKIP] No valid IPv4 available'),
+        (New-Line 'Result' '[FAIL] Network interface unavailable'))
 }
 
 function Invoke-DuckDnsApi($Config, [string]$PublicIP, [bool]$SingleAttempt = $false) {
     $token = $null
-    try { $token = Read-Token }
+    try { $tokenIdentity = Get-TokenFileIdentity; $token = Read-Token }
     catch { return [pscustomobject]@{ Kind = 'Token'; Status = 'Unavailable' } }
     try {
-        $subdomain = $Config.Domain.Substring(0, $Config.Domain.Length - 12)
-        $url = 'https://www.duckdns.org/update?domains=' + [uri]::EscapeDataString($subdomain) +
+        $hostname = $Config.Hostname
+        $url = 'https://www.duckdns.org/update?domains=' + [uri]::EscapeDataString($hostname) +
             '&token=' + [uri]::EscapeDataString($token) + '&ip=' + [uri]::EscapeDataString($PublicIP) + '&verbose=true'
         $attempts = [int]$Config.Retry.Attempts
         if ($SingleAttempt) { $attempts = 1 }
@@ -598,11 +888,11 @@ function Invoke-DuckDnsApi($Config, [string]$PublicIP, [bool]$SingleAttempt = $f
                 $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
                 Assert-Deadline
                 $lines = @(([string]$response.Content -replace "`r", '').Trim() -split "`n")
-                if ($lines.Count -and $lines[0].Trim() -eq 'KO') { return [pscustomobject]@{ Kind = 'Rejected'; Status = 'Rejected' } }
+                if ($lines.Count -and $lines[0].Trim() -eq 'KO') { return [pscustomobject]@{ Kind = 'Rejected'; Status = 'Rejected'; TokenIdentity = $tokenIdentity } }
                 if ($lines.Count -and $lines[0].Trim() -eq 'OK') {
                     $status = 'Updated'
                     if (@($lines | Where-Object { $_.Trim() -eq 'NOCHANGE' }).Count) { $status = 'NoChange' }
-                    return [pscustomobject]@{ Kind = 'Success'; Status = $status }
+                    return [pscustomobject]@{ Kind = 'Success'; Status = $status; TokenIdentity = $tokenIdentity }
                 }
                 return [pscustomobject]@{ Kind = 'InvalidResponse'; Status = 'InvalidResponse' }
             } catch {
@@ -618,21 +908,24 @@ function Invoke-DuckDnsApi($Config, [string]$PublicIP, [bool]$SingleAttempt = $f
     }
 }
 
-function Invoke-CheckFlow($Config, $State, [string]$RunReason) {
+function Invoke-CheckFlow($Config, $State, [string]$RunReason, [bool]$SingleAttempt = $false) {
     $lines = @()
     $code = 0
     $now = [DateTime]::UtcNow.ToString('o')
     $previousPublic = $State.LastDetectedPublicIPv4
     $previousSync = $State.SynchronizationState
     $previousUpdate = $State.LastSuccessfulUpdateUtc
-    $State.Domain = $Config.Domain
+    $State.Domain = Get-DuckDnsDomain $Config
+    $credentials = Get-CredentialsStatus $Config $State
+    if ($credentials -eq '[WARN] Protected; verification pending') { Reset-CredentialVerification $State }
     $State.LastCheckUtc = $now
     $State.LastReason = $RunReason
     if (-not $Config.CompareIpBeforeUpdate) { $State.DuckDnsIPv4 = $null }
     if (-not (Test-TokenLocal)) {
+        Reset-CredentialVerification $State
         $State.LastDetectedPublicIPv4 = $null
         $State.DuckDnsIPv4 = $null
-        $lines += New-Line 'Token' '[FAIL] Unavailable or cannot be decrypted'
+        $lines += New-Line 'Credentials' '[FAIL] Unavailable'
         $lines += New-Line 'DuckDNS API' '[SKIP] No request sent'
         $lines += New-Line 'Result' '[FAIL] Token unavailable'
         $State.SynchronizationState = 'Failed'
@@ -641,6 +934,9 @@ function Invoke-CheckFlow($Config, $State, [string]$RunReason) {
         return [pscustomobject]@{ Lines = $lines; ExitCode = $ExitCodes.Token }
     }
     $found = Find-PublicIPv4 $Config
+    if ($found.InterfaceUnavailable) {
+        return [pscustomobject]@{ Lines = @(Get-InterfaceFailureRows); ExitCode = $ExitCodes.PublicIp }
+    }
     if (-not $found.IP) {
         $State.LastDetectedPublicIPv4 = $null
         $State.DuckDnsIPv4 = $null
@@ -675,7 +971,7 @@ function Invoke-CheckFlow($Config, $State, [string]$RunReason) {
             if ($null -ne $before -and $before.Addresses.Count -eq 1) { $equal = ($before.Addresses[0] -eq $ip) }
 
             $recentPending = $false
-            if (-not $equal -and $previousSync -eq 'Pending' -and $previousPublic -eq $ip -and $previousUpdate) {
+            if ($credentials -eq '[OK] Protected and verified' -and -not $equal -and $previousSync -eq 'Pending' -and $previousPublic -eq $ip -and $previousUpdate) {
                 try {
                     $age = ([DateTime]::UtcNow - [DateTime]::Parse([string]$previousUpdate).ToUniversalTime()).TotalMinutes
                     $recentPending = ($age -ge 0 -and $age -lt 5)
@@ -689,7 +985,12 @@ function Invoke-CheckFlow($Config, $State, [string]$RunReason) {
             }
             if (-not $equal) {
                 $confirmedIP = Confirm-PublicIPv4 $Config $found
+                if ($confirmedIP.InterfaceUnavailable) {
+                    $State.LastDetectedPublicIPv4 = $previousPublic
+                    return [pscustomobject]@{ Lines = @(Get-InterfaceFailureRows); ExitCode = $ExitCodes.PublicIp }
+                }
                 if (-not $confirmedIP.IP) {
+                    $State.LastDetectedPublicIPv4 = $previousPublic
                     $lines[0] = New-Line 'Public IPv4' '[WARN] Provider disagreement'
                     $lines += New-Line 'DuckDNS API' '[SKIP] IP change not confirmed'
                     $lines += New-Line 'Result' '[WARN] Public IPv4 change unconfirmed'
@@ -709,12 +1010,15 @@ function Invoke-CheckFlow($Config, $State, [string]$RunReason) {
                 }
                 $forced = ([DateTime]::UtcNow - $last).TotalHours -ge [int]$Config.ForcedUpdate.IntervalHours
             }
-            if ($equal -and -not $forced) {
+            $needsVerification = ($credentials -ne '[OK] Protected and verified' -and
+                (-not $State.PSObject.Properties['CanPersist'] -or $State.CanPersist))
+            if ($equal -and -not $forced -and -not $needsVerification) {
                 $State.SynchronizationState = 'Synchronized'
                 $lines += New-Line 'DuckDNS API' '[SKIP] No update required'
                 $lines += New-Line 'Result' '[OK] Synchronized'
             } else {
-                $api = Invoke-DuckDnsApi $Config $ip
+                $api = Invoke-DuckDnsApi $Config $ip ($SingleAttempt -or ($equal -and -not $forced))
+                Set-CredentialOutcome $Config $State $api
                 if ($api.Kind -eq 'Success') {
                     $State.LastSuccessfulUpdateUtc = [DateTime]::UtcNow.ToString('o')
                     $apiMessage = '[OK] Updated'
@@ -750,7 +1054,7 @@ function Invoke-CheckFlow($Config, $State, [string]$RunReason) {
                         }
                     }
                 } elseif ($api.Kind -eq 'Token') {
-                    $lines += New-Line 'Token' '[FAIL] Unavailable or cannot be decrypted'
+                    $lines += New-Line 'Credentials' '[FAIL] Unavailable'
                     $lines += New-Line 'DuckDNS API' '[SKIP] No request sent'
                     $lines += New-Line 'Result' '[FAIL] Token unavailable'
                     $code = $ExitCodes.Token
@@ -767,15 +1071,22 @@ function Invoke-CheckFlow($Config, $State, [string]$RunReason) {
     return [pscustomobject]@{ Lines = $lines; ExitCode = $code }
 }
 
-function Complete-Check($Config, $State, [string]$RunReason) {
+function Complete-Check($Config, $State, [string]$RunReason, [bool]$SingleAttempt = $false) {
     if ($null -eq $script:RunClock) { Start-Deadline }
-    if ($State.Domain -and $State.Domain -cne $Config.Domain) {
-        foreach ($name in @('DuckDnsIPv4','LastCheckUtc','LastSuccessfulUpdateUtc','LastSuccessfulCheckUtc','LastReason','LastResult')) { $State.$name = $null }
+    if ($State.Domain -and $State.Domain -cne (Get-DuckDnsDomain $Config)) {
+        foreach ($name in @('LastDetectedPublicIPv4','DuckDnsIPv4','LastCheckUtc','LastSuccessfulUpdateUtc','LastSuccessfulCheckUtc','LastReason','LastResult')) { $State.$name = $null }
         $State.SynchronizationState = 'Unknown'; $State.ConsecutiveFailures = 0
+        Reset-CredentialVerification $State
     }
-    try { $result = Invoke-CheckFlow $Config $State $RunReason }
+    try { $result = Invoke-CheckFlow $Config $State $RunReason $SingleAttempt }
     catch [TimeoutException] {
         $result = [pscustomobject]@{ Lines = @((New-Line 'Result' '[FAIL] Execution timeout')); ExitCode = $ExitCodes.Timeout }
+    }
+    $lastResult = $result.Lines[-1]
+    if (-not @($result.Lines | Where-Object { $_.Label -eq 'Credentials' }).Count -and
+        @($result.Lines | Where-Object { $_.Label -eq 'DuckDNS API' -and -not $_.Value.StartsWith('[SKIP]') }).Count) {
+        $result.Lines = @($result.Lines | Select-Object -SkipLast 1) +
+            @((New-Line 'Credentials' (Get-CredentialsStatus $Config $State)), $lastResult)
     }
     $State.ApplicationVersion = $ScriptVersion
     $State.LastResult = $result.Lines[-1].Value
@@ -1067,111 +1378,170 @@ function Set-ConfigValue([string]$Key, $Value, [string]$TaskKind = '') {
     } finally { Exit-RunLock $handle }
 }
 
-function Change-Domain {
-    Show-Header 'CHANGE DOMAIN'
+function Change-Hostname {
+    Show-Header 'CHANGE HOSTNAME'
     $config = Read-Config
-    Write-Rows @((New-Line 'Current domain' $config.Domain))
+    Write-Rows @((New-Line 'Current hostname' $config.Hostname), (New-Line 'Domain' (Get-DuckDnsDomain $config)))
     Write-Host ''
     Write-Host ' [0] Cancel'
     while ($true) {
-        $entry = Read-Choice 'New domain or subdomain'
+        $entry = Read-Choice 'New hostname'
         if ($entry -eq '0' -or [string]::IsNullOrWhiteSpace($entry)) { return }
-        try { $domain = Normalize-Domain $entry; break }
-        catch { Write-Rows @((New-Line 'Domain' '[WARN] Enter a valid DuckDNS domain')) }
+        try { $hostname = Normalize-Hostname $entry; break }
+        catch { Write-Rows @((New-Line 'Hostname' '[WARN] Enter a valid DuckDNS hostname')) }
     }
-    if ($domain -ceq $config.Domain) { Show-ResultScreen 'CHANGE DOMAIN' @((New-Line 'Domain' '[SKIP] Domain is unchanged')); return }
+    if ($hostname -ceq $config.Hostname) { Show-ResultScreen 'CHANGE HOSTNAME' @((New-Line 'Hostname' '[SKIP] Hostname is unchanged')); return }
     $handle = Enter-RunLock
-    if ($null -eq $handle) { Show-ResultScreen 'CHANGE DOMAIN' @((New-Line 'Domain' '[SKIP] Another instance is running')); return }
+    if ($null -eq $handle) { Show-ResultScreen 'CHANGE HOSTNAME' @((New-Line 'Hostname' '[SKIP] Another instance is running')); return }
     try {
         $config = Read-Config
-        $config.Domain = $domain
-        $previousState = Read-State -Recover
-        if (-not $previousState.CanPersist) { throw 'State access failure.' }
+        $prior = Read-State -Recover
+        if (-not $prior.CanPersist) { throw 'State access failure.' }
         $state = New-EmptyState
+        $state.LastStateRecoveryUtc = $prior.LastStateRecoveryUtc
+        $state.LastStateRecoveryReason = $prior.LastStateRecoveryReason
         Save-State $state
+        $config.Hostname = $hostname
         Save-Config $config
-        $rows = @((New-Line 'Domain' '[OK] Domain changed'), (New-Line 'Status' '[INFO] Check the new domain with Update Now'))
-    } catch { $rows = @((New-Line 'Domain' '[FAIL] Could not change domain')) }
+        $rows = @((New-Line 'Hostname' ('[OK] ' + $hostname)), (New-Line 'Domain' (Get-DuckDnsDomain $config)),
+            (New-Line 'Credentials' (Get-CredentialsStatus $config $state)),
+            (New-Line 'Status' '[INFO] Check the new hostname with Update Now'))
+    } catch { $rows = @((New-Line 'Hostname' '[FAIL] Could not change hostname')) }
     finally { Exit-RunLock $handle }
-    Show-ResultScreen 'CHANGE DOMAIN' $rows
+    Show-ResultScreen 'CHANGE HOSTNAME' $rows
 }
 
 function Change-Token {
     Show-Header 'CHANGE TOKEN'
-    $configured = '[FAIL] Unavailable'
-    if (Test-TokenLocal) { $configured = '[OK] Configured' }
-    Write-Rows @((New-Line 'Token' $configured))
+    Write-Rows @((New-Line 'Credentials' (Get-CredentialsStatus (Read-Config) (Read-State))))
     Write-Host ''
     if ((Read-Choice 'Press Enter to enter a token, or 0 to cancel') -eq '0') { return }
     while ($true) {
         $secure = Read-Host ' New token (hidden; blank cancels)' -AsSecureString
         if ($null -eq $secure -or $secure.Length -eq 0) { return }
         try { $cipher = ConvertTo-TokenBytes $secure; break }
-        catch { Write-Rows @((New-Line 'Token' '[WARN] Enter a valid token')) }
+        catch { Write-Rows @((New-Line 'Credentials' '[WARN] Enter a valid token')) }
         finally { if ($secure) { $secure.Dispose() } }
     }
-    $handle = Enter-RunLock
-    if ($null -eq $handle) { Show-ResultScreen 'CHANGE TOKEN' @((New-Line 'Token' '[SKIP] Another instance is running')); return }
-    $tokenSaved = $false; $state = $null
+    $handle = $null; $saved = $false
     try {
-        Write-AtomicBytes $TokenPath $cipher
-        $tokenSaved = $true
-        Set-SecureAcl $TokenPath $false
-        $config = Read-Config
-        $state = Read-State -Recover
-        Start-Deadline
-        $rows = @((New-Line 'Token' '[OK] Saved'))
-        $detected = Find-PublicIPv4 $config
-        if (-not $detected.IP) {
-            $rows += New-Line 'DuckDNS API' '[WARN] Validation pending'
-            $state.SynchronizationState = 'Unknown'
-            $state.LastResult = '[WARN] Token validation pending'
-            $state.LastExitCode = $ExitCodes.PublicIp
+        $handle = Enter-RunLock
+        if ($null -eq $handle) {
+            $rows = @((New-Line 'Setting' '[SKIP] Another instance is running'))
         } else {
-            $detected = Confirm-PublicIPv4 $config $detected
-            if (-not $detected.IP) { $api = [pscustomobject]@{ Kind = 'Network'; Status = 'Unconfirmed' } }
-            else { $api = Invoke-DuckDnsApi $config $detected.IP $true }
-            if ($api.Kind -eq 'Success') {
-                $rows += New-Line 'DuckDNS API' '[OK] Token accepted'
-                $state.LastSuccessfulUpdateUtc = [DateTime]::UtcNow.ToString('o')
-                $state.SynchronizationState = 'Accepted'
-                $state.LastResult = '[OK] Token accepted'
-                $state.LastExitCode = 0
-            } elseif ($api.Kind -eq 'Rejected') {
-                $rows += New-Line 'DuckDNS API' '[FAIL] Request rejected'
-                $state.SynchronizationState = 'Failed'
-                $state.LastResult = '[FAIL] Request rejected'
-                $state.LastExitCode = $ExitCodes.Api
-            } else {
-                $rows += New-Line 'DuckDNS API' '[WARN] Validation pending'
-                $state.SynchronizationState = 'Unknown'
-                $state.LastResult = '[WARN] Token validation pending'
-                $state.LastExitCode = $ExitCodes.Api
-            }
-            $state.LastDetectedPublicIPv4 = $detected.IP
-        }
-        $state.LastReason = 'Manual'
-        $state.LastCheckUtc = [DateTime]::UtcNow.ToString('o')
-        $state.Domain = $config.Domain
-        try { Save-State $state }
-        catch { $rows += New-Line 'Saved state' '[FAIL] Could not save status' }
-    } catch [TimeoutException] {
-        $rows = @((New-Line 'Token' '[OK] Saved'), (New-Line 'DuckDNS API' '[WARN] Validation pending'))
-        if ($null -ne $state) {
-            $state.SynchronizationState = 'Unknown'; $state.LastResult = '[WARN] Token validation pending'
-            $state.LastExitCode = $ExitCodes.Timeout; $state.LastCheckUtc = [DateTime]::UtcNow.ToString('o')
-            $state.LastReason = 'Manual'
-            try { Save-State $state } catch { $rows += New-Line 'Saved state' '[FAIL] Could not save status' }
+            $config = Read-Config; $state = Read-State -Recover
+            if (-not $state.CanPersist) { throw 'State access failure.' }
+            Reset-CredentialVerification $state
+            $state.LastSuccessfulUpdateUtc = $null; $state.LastSuccessfulCheckUtc = $null
+            $state.SynchronizationState = 'Unknown'
+            Save-State $state
+            Write-AtomicBytes $TokenPath $cipher
+            $saved = $true
+            # Local persistence, check, real verification and final state all share this lock.
+            Start-Deadline
+            $result = Complete-Check $config $state 'Manual' $true
+            $rows = @((New-Line 'Setting' '[OK] Token saved'),
+                (New-Line 'Credentials' (Get-CredentialsStatus $config $state))) +
+                @($result.Lines | Where-Object { $_.Label -ne 'Credentials' })
         }
     } catch {
-        if ($tokenSaved) { $rows = @((New-Line 'Token' '[OK] Saved'), (New-Line 'DuckDNS API' '[WARN] Validation pending')) }
-        else { $rows = @((New-Line 'Token' '[FAIL] Could not save token')) }
-    }
-    finally {
+        if ($saved) { $rows = @((New-Line 'Setting' '[OK] Token saved'),
+            (New-Line 'Credentials' '[WARN] Protected; verification pending')) }
+        else { $rows = @((New-Line 'Setting' '[FAIL] Could not save token')) }
+    } finally {
         [Array]::Clear($cipher, 0, $cipher.Length)
-        Exit-RunLock $handle
+        if ($null -ne $handle) { Exit-RunLock $handle }
     }
     Show-ResultScreen 'CHANGE TOKEN' $rows
+}
+
+function Get-InterfaceDisplayRows($Config) {
+    $rows = @((New-Line 'Mode' $Config.NetworkInterface.Mode))
+    if ($Config.NetworkInterface.Mode -eq 'Specific') {
+        $context = Get-PublicIpContext $Config
+        if ($context.Available) { $rows += New-Line 'Interface' $context.InterfaceAlias; $rows += New-Line 'Local IPv4' $context.IPv4 }
+        else { $rows += New-Line 'Interface' '[FAIL] Selected interface unavailable' }
+    }
+    return $rows
+}
+
+function Save-NetworkInterface($Value, $TestedContext = $null) {
+    $handle = Enter-RunLock
+    if ($null -eq $handle) { return @((New-Line 'Setting' '[SKIP] Another instance is running')) }
+    try {
+        $config = Read-Config
+        if ($Value.Mode -eq 'Specific' -and ($null -eq $TestedContext -or
+            $TestedContext.Mode -ne 'Specific' -or ([guid]$TestedContext.InterfaceGuid) -ne ([guid]$Value.InterfaceGuid) -or
+            -not (Test-PublicIpContext $TestedContext))) {
+            return @((New-Line 'Setting' '[FAIL] Interface changed; select and test it again'))
+        }
+        $config.NetworkInterface = $Value
+        Save-Config $config
+        return @((New-Line 'Setting' '[OK] Network interface saved'))
+    } catch { return @((New-Line 'Setting' '[FAIL] Could not save interface')) }
+    finally { Exit-RunLock $handle }
+}
+
+function Select-NetworkInterface {
+    while ($true) {
+        Show-Header 'SELECT INTERFACE'
+        $interfaces = @(Get-UsableInterfaces)
+        if (-not $interfaces.Count) { Write-Rows @((New-Line 'Interfaces' '[WARN] No active IPv4 interfaces')) }
+        for ($i = 0; $i -lt $interfaces.Count; $i++) {
+            $name = $interfaces[$i].InterfaceAlias
+            if ($interfaces[$i].IsVirtual) { $name += ' [Virtual]' }
+            Write-Host (' [' + ($i + 1) + '] ' + $name)
+            Write-Host ('     IPv4: ' + $interfaces[$i].IPv4)
+            Write-Host ''
+        }
+        Write-Host ' [0] Back'
+        $choice = Read-Choice
+        if ($choice -eq '0') { return }
+        $number = 0
+        if (-not [int]::TryParse($choice, [ref]$number) -or $number -lt 1 -or $number -gt $interfaces.Count) {
+            Write-Rows @((New-Line 'Input' '[WARN] Choose a listed interface')); continue
+        }
+        $selected = $interfaces[$number - 1]
+        $config = Read-Config
+        $config.NetworkInterface = [pscustomobject]@{ Mode = 'Specific'; InterfaceGuid = $selected.InterfaceGuid }
+        Show-Header 'TEST INTERFACE'
+        Write-Rows @((New-Line 'Interface' $selected.InterfaceAlias))
+        Start-Deadline
+        try {
+            $found = Find-PublicIPv4 $config
+            if ($found.IP) { $found = Confirm-PublicIPv4 $config $found }
+        } catch { $found = $null }
+        finally { $script:RunClock = $null }
+        if ($null -eq $found -or -not $found.IP) {
+            Write-Rows @((New-Line 'Local IPv4' $selected.IPv4), (New-Line 'Connectivity' '[FAIL] Public IP query failed'))
+            Wait-Back; continue
+        }
+        Write-Rows @((New-Line 'Local IPv4' $found.Context.IPv4), (New-Line 'Connectivity' '[OK]'),
+            (New-Line 'Public IPv4' ('[OK] ' + $found.IP)))
+        if (-not (Read-Confirmation 'Use this interface?')) { continue }
+        Show-ResultScreen 'NETWORK INTERFACE' (Save-NetworkInterface $config.NetworkInterface $found.Context)
+        return
+    }
+}
+
+function Show-NetworkInterface {
+    while ($true) {
+        $config = Read-Config
+        Show-Header 'NETWORK INTERFACE'
+        Write-Rows @(Get-InterfaceDisplayRows $config)
+        Write-Host ''
+        Write-Host ' [1] Automatic'
+        if ($config.NetworkInterface.Mode -eq 'Specific') { Write-Host ' [2] Change Interface' }
+        else { Write-Host ' [2] Select Interface' }
+        Write-Host ''
+        Write-Host ' [0] Back'
+        switch (Read-Choice) {
+            '0' { return }
+            '1' { Show-ResultScreen 'NETWORK INTERFACE' (Save-NetworkInterface ([pscustomobject]@{ Mode = 'Automatic'; InterfaceGuid = $null })) }
+            '2' { Select-NetworkInterface }
+            default { Write-Rows @((New-Line 'Input' '[WARN] Choose an option from 0 to 2')) }
+        }
+    }
 }
 
 function Show-RetrySettings {
@@ -1199,7 +1569,7 @@ function Show-ForcedSettings {
     while ($true) {
         $config = Read-Config
         $state = Read-State
-        if ($state.Domain -and $state.Domain -cne $config.Domain) { $state = New-EmptyState }
+        if ($state.Domain -and $state.Domain -cne (Get-DuckDnsDomain $config)) { $state = New-EmptyState }
         Show-Header 'FORCED UPDATE'
         $enabled = '[OFF]'; if ($config.ForcedUpdate.Enabled) { $enabled = '[ON]' }
         Write-Rows @((New-Line 'Forced update' $enabled),
@@ -1257,12 +1627,21 @@ function Show-Configuration {
     while ($true) {
         $config = Read-Config
         Show-Header 'CONFIGURATION'
-        $tokenState = '[FAIL] Unavailable'; if (Test-TokenLocal) { $tokenState = '[OK] Configured' }
+        $credentials = Get-CredentialsStatus $config (Read-State)
         $compare = '[OFF]'; if ($config.CompareIpBeforeUpdate) { $compare = '[ON]' }
         $validation = '[OFF]'; if ($config.PostUpdateValidation) { $validation = '[ON]' }
         $forced = '[OFF]'; if ($config.ForcedUpdate.Enabled) { $forced = '[ON]' }
         $logging = '[OFF]'; if ($config.Logging.Enabled) { $logging = '[ON]' }
-        Write-Rows @((New-Line 'Domain' $config.Domain), (New-Line 'Token' $tokenState))
+        Write-Rows @((New-Line 'Hostname' $config.Hostname), (New-Line 'Domain' (Get-DuckDnsDomain $config)),
+            (New-Line 'Credentials' $credentials))
+        Write-Host ''
+        $interface = 'Automatic'
+        if ($config.NetworkInterface.Mode -eq 'Specific') {
+            $context = Get-PublicIpContext $config
+            $interface = '[FAIL] Selected interface unavailable'
+            if ($context.Available) { $interface = $context.InterfaceAlias }
+        }
+        Write-Rows @((New-Line 'Network interface' $interface))
         Write-Host ''
         Write-Rows @((New-Line 'Compare IP' $compare), (New-Line 'Post-update validation' $validation),
             (New-Line 'DNS mode' $config.Dns.Mode))
@@ -1276,28 +1655,30 @@ function Show-Configuration {
         Write-Host ''
         Write-Rows @((New-Line 'Logging' $logging))
         Show-Section 'MENU'
-        Write-Host ' [1] Change Domain'
+        Write-Host ' [1] Change Hostname'
         Write-Host ' [2] Change Token'
-        Write-Host ' [3] Compare IP Before Update'
-        Write-Host ' [4] Post-Update Validation'
-        Write-Host ' [5] DNS Settings'
-        Write-Host ' [6] Retry Settings'
-        Write-Host ' [7] Forced Update'
-        Write-Host ' [8] Logging'
+        Write-Host ' [3] Network Interface'
+        Write-Host ' [4] DNS Settings'
+        Write-Host ' [5] Compare IP Before Update'
+        Write-Host ' [6] Post-Update Validation'
+        Write-Host ' [7] Retry Settings'
+        Write-Host ' [8] Forced Update'
+        Write-Host ' [9] Logging'
         Write-Host ''
         Write-Host ' [0] Back'
         $choice = Read-Choice
         switch ($choice) {
             '0' { return }
-            '1' { Change-Domain }
+            '1' { Change-Hostname }
             '2' { Change-Token }
-            '3' { Show-ResultScreen 'CONFIGURATION' (Set-ConfigValue 'Compare' (-not $config.CompareIpBeforeUpdate)) }
-            '4' { Show-ResultScreen 'CONFIGURATION' (Set-ConfigValue 'PostValidation' (-not $config.PostUpdateValidation)) }
-            '5' { Show-DnsSettings }
-            '6' { Show-RetrySettings }
-            '7' { Show-ForcedSettings }
-            '8' { Show-ResultScreen 'CONFIGURATION' (Set-ConfigValue 'Logging' (-not $config.Logging.Enabled)) }
-            default { Write-Rows @((New-Line 'Input' '[WARN] Choose an option from 0 to 8')); Start-Sleep -Seconds 1 }
+            '3' { Show-NetworkInterface }
+            '4' { Show-DnsSettings }
+            '5' { Show-ResultScreen 'CONFIGURATION' (Set-ConfigValue 'Compare' (-not $config.CompareIpBeforeUpdate)) }
+            '6' { Show-ResultScreen 'CONFIGURATION' (Set-ConfigValue 'PostValidation' (-not $config.PostUpdateValidation)) }
+            '7' { Show-RetrySettings }
+            '8' { Show-ForcedSettings }
+            '9' { Show-ResultScreen 'CONFIGURATION' (Set-ConfigValue 'Logging' (-not $config.Logging.Enabled)) }
+            default { Write-Rows @((New-Line 'Input' '[WARN] Choose an option from 0 to 9')); Start-Sleep -Seconds 1 }
         }
     }
 }
@@ -1346,11 +1727,11 @@ function Show-Scheduling {
 function Show-Status {
     $config = Read-Config
     $state = Read-State
-    if ($state.Domain -and $state.Domain -cne $config.Domain) { $state = New-EmptyState }
+    if ($state.Domain -and $state.Domain -cne (Get-DuckDnsDomain $config)) { $state = New-EmptyState }
     Show-Header 'STATUS'
     $public = 'Unknown'; if ($state.LastDetectedPublicIPv4) { $public = [string]$state.LastDetectedPublicIPv4 }
     $dns = 'Unknown'; if ($state.DuckDnsIPv4) { $dns = [string]$state.DuckDnsIPv4 }
-    Write-Rows @((New-Line 'Domain' $config.Domain), (New-Line 'Public IP' $public),
+    Write-Rows @((New-Line 'Domain' (Get-DuckDnsDomain $config)), (New-Line 'Public IP' $public),
         (New-Line 'DuckDNS IP' $dns), (New-Line 'Status' (Get-StatusText $state)))
     Write-Host ''
     $reasonText = 'Unknown'; if ($state.LastReason) { $reasonText = [string]$state.LastReason }
@@ -1367,7 +1748,9 @@ function Show-Status {
 
 function Test-RuntimeAcl {
     try {
-        foreach ($path in @($Root, $TokenPath)) {
+        $paths = @($Root, $TokenPath)
+        if ([IO.File]::Exists($CredentialReceiptPath)) { $paths += $CredentialReceiptPath }
+        foreach ($path in $paths) {
             $acl = Get-Acl -LiteralPath $path
             if (-not $acl.AreAccessRulesProtected) { return $false }
             $seen = @()
@@ -1392,8 +1775,10 @@ function Get-FullDiagnosticRows($Config) {
     $overall = '[OK]'
     try { Assert-Config $Config; $rows += New-Line 'Configuration' '[OK]' }
     catch { $rows += New-Line 'Configuration' '[FAIL] Invalid'; $overall = '[FAIL]' }
-    if (Test-TokenLocal) { $rows += New-Line 'Token' '[OK] Protected' }
-    else { $rows += New-Line 'Token' '[FAIL] Unavailable'; $overall = '[FAIL]' }
+    $credentialStatus = Get-CredentialsStatus $Config (Read-State)
+    $rows += New-Line 'Credentials' $credentialStatus
+    if ($credentialStatus.StartsWith('[FAIL]')) { $overall = '[FAIL]' }
+    elseif ($credentialStatus.StartsWith('[WARN]')) { $overall = '[WARN]' }
     if (Test-RuntimeAcl) { $rows += New-Line 'Runtime ACL' '[OK]' }
     else { $rows += New-Line 'Runtime ACL' '[FAIL] Unexpected access detected'; $overall = '[FAIL]' }
     $state = Read-State
@@ -1409,14 +1794,29 @@ function Get-FullDiagnosticRows($Config) {
     $rows += New-Line 'Manager version' $ScriptVersion
     $rows += New-Line 'Config schema' ([string]$Config.SchemaVersion)
     $rows += New-SectionRow 'NETWORK'
+    $rows += New-Line 'Interface mode' $Config.NetworkInterface.Mode
     Assert-Deadline 16
     try {
         $request = Invoke-WebRequest -Uri 'https://www.duckdns.org/' -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
         $rows += New-Line 'HTTPS' '[OK] DuckDNS reachable'
     } catch { $rows += New-Line 'HTTPS' '[FAIL] DuckDNS unavailable'; $overall = '[FAIL]' }
     $found = Find-PublicIPv4 $Config
+    if ($Config.NetworkInterface.Mode -eq 'Specific') {
+        if ($found.Context -and $found.Context.Available -and -not $found.InterfaceUnavailable) {
+            $rows += New-Line 'Interface' ('[OK] ' + $found.Context.InterfaceAlias)
+            $rows += New-Line 'Local IPv4' ('[OK] ' + $found.Context.IPv4)
+        } else { $rows += New-Line 'Interface' '[FAIL] Selected interface unavailable' }
+    }
     if ($found.IP) { $rows += New-Line 'Public IPv4' ('[OK] ' + $found.IP) }
-    else { $rows += New-Line 'Public IPv4' '[FAIL] All providers failed'; $overall = '[FAIL]' }
+    else {
+        $message = '[FAIL] All providers failed'
+        if ($found.InterfaceUnavailable) { $message = '[FAIL] Could not query selected interface' }
+        $rows += New-Line 'Public IPv4' $message; $overall = '[FAIL]'
+    }
+    if ($Config.NetworkInterface.Mode -eq 'Automatic') { $rows += New-Line 'Public IP binding' '[INFO] Windows routing' }
+    elseif ($found.IP -and $found.Context -and $found.Context.Mode -eq 'Specific') {
+        $rows += New-Line 'Public IP binding' '[OK] Interface enforced'
+    } else { $rows += New-Line 'Public IP binding' '[FAIL] Not verified' }
     $resolved = Resolve-HostA $Config $false
     if ($resolved.Success) {
         $display = 'No A record'; if ($resolved.Addresses.Count) { $display = $resolved.Addresses -join ', ' }
@@ -1447,10 +1847,12 @@ function Show-DiagnosticTest([int]$Choice) {
         2 {
             $found = Find-PublicIPv4 $config
             if ($found.IP) { $rows += New-Line 'Public IPv4' ('[OK] ' + $found.IP) }
+            elseif ($found.InterfaceUnavailable) { $rows += @(Get-InterfaceFailureRows) }
             else { $rows += New-Line 'Public IPv4' '[FAIL] All providers failed' }
         }
         3 {
             $found = Find-PublicIPv4 $config $true
+            if ($found.InterfaceUnavailable) { $rows += @(Get-InterfaceFailureRows) }
             foreach ($provider in $found.Results) {
                 $message = '[FAIL] Unavailable'; if ($provider.IP) { $message = '[OK] ' + $provider.IP }
                 $rows += New-Line $provider.Provider $message
@@ -1564,7 +1966,7 @@ function Show-Maintenance {
             '2' {
                 Show-Header 'RESTORE DEFAULTS'
                 Write-Host ' Operational settings and scheduling will return to defaults.'
-                Write-Host ' Domain and token will be preserved.'
+                Write-Host ' Hostname and token will be preserved.'
                 Write-Host ''
                 if (-not (Read-Confirmation 'Restore defaults?')) { Show-ResultScreen 'RESTORE DEFAULTS' @((New-Line 'Settings' '[SKIP] No changes made')); break }
                 $handle = Enter-RunLock
@@ -1573,7 +1975,7 @@ function Show-Maintenance {
                     try {
                         $old = Read-Config
                         $defaults = New-DefaultConfig
-                        $defaults.Domain = $old.Domain
+                        $defaults.Hostname = $old.Hostname
                         Save-Config $defaults
                         $rows = @((New-Line 'Settings' '[OK] Restored'))
                         $result = @(Repair-ManagerTasks $defaults)
@@ -1598,7 +2000,7 @@ function Show-Maintenance {
             '5' {
                 Show-Header 'CLEAR SAVED STATE'
                 Write-Host ' Last check, result, and saved IP state will be cleared.'
-                Write-Host ' Domain, token, settings, and tasks will be preserved.'
+                Write-Host ' Hostname, token, settings, and tasks will be preserved.'
                 Write-Host ''
                 if (-not (Read-Confirmation 'Clear saved state?')) { Show-ResultScreen 'CLEAR SAVED STATE' @((New-Line 'Saved state' '[SKIP] No changes made')); break }
                 $handle = Enter-RunLock
@@ -1642,7 +2044,7 @@ function Show-Maintenance {
                     Remove-ManagerTasks
                     Remove-CorruptStateFiles
                     [void](Clear-ManagerLogs)
-                    foreach ($path in @($ConfigPath, $PreviousConfigPath, $TokenPath, $StatusPath, $InstalledScript)) {
+                    foreach ($path in @($ConfigPath, $PreviousConfigPath, $TokenPath, $CredentialReceiptPath, $StatusPath, $InstalledScript)) {
                         if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
                     }
                     $rows = @((New-Line 'Uninstall' '[OK] DuckDNS Manager removed'))
@@ -1701,17 +2103,17 @@ function Install-Manager {
     $config = New-DefaultConfig
     while ($true) {
         Write-Host ' [0] Cancel'
-        $entered = Read-Choice 'Domain or subdomain'
+        $entered = Read-Choice 'Hostname'
         if ($entered -eq '0' -or [string]::IsNullOrWhiteSpace($entered)) { return $false }
-        try { $config.Domain = Normalize-Domain $entered; break }
-        catch { Write-Rows @((New-Line 'Domain' '[WARN] Enter a valid DuckDNS domain')) }
+        try { $config.Hostname = Normalize-Hostname $entered; break }
+        catch { Write-Rows @((New-Line 'Hostname' '[WARN] Enter a valid DuckDNS hostname')) }
     }
     if ((Read-Choice 'Press Enter to enter a token, or 0 to cancel') -eq '0') { return $false }
     while ($true) {
         $secure = Read-Host ' Token (hidden; blank cancels)' -AsSecureString
         if ($null -eq $secure -or $secure.Length -eq 0) { return $false }
         try { $cipher = ConvertTo-TokenBytes $secure; break }
-        catch { Write-Rows @((New-Line 'Token' '[WARN] Enter a valid token')) }
+        catch { Write-Rows @((New-Line 'Credentials' '[WARN] Enter a valid token')) }
         finally { if ($secure) { $secure.Dispose() } }
     }
     Write-Host ''
@@ -1744,34 +2146,8 @@ function Install-Manager {
             Start-Deadline
             $state = Read-State -Recover
             $check = Complete-Check $config $state 'Manual'
-            $tokenValidation = '[WARN] Validation pending'
-            $apiLines = @($check.Lines | Where-Object { $_.Label -eq 'DuckDNS API' })
-            if ($apiLines.Count -and $apiLines[-1].Value.StartsWith('[OK]')) { $tokenValidation = '[OK] Token accepted' }
-            if ($apiLines.Count -and $apiLines[-1].Value -in @('[SKIP] No update required')) {
-                $ip = $state.LastDetectedPublicIPv4
-                if ($ip) {
-                    try { $api = Invoke-DuckDnsApi $config $ip $true }
-                    catch [TimeoutException] { $api = [pscustomobject]@{ Kind = 'Network' } }
-                    if ($api.Kind -eq 'Success') {
-                        $tokenValidation = '[OK] Token accepted'
-                        $state.LastSuccessfulUpdateUtc = [DateTime]::UtcNow.ToString('o')
-                    } elseif ($api.Kind -eq 'Rejected') {
-                        $tokenValidation = '[FAIL] Request rejected'
-                        $state.SynchronizationState = 'Failed'
-                        $state.LastResult = '[FAIL] Request rejected'
-                        $state.LastExitCode = $ExitCodes.Api
-                        $state.LastSuccessfulCheckUtc = $null
-                        $state.ConsecutiveFailures = 1
-                    } else {
-                        $state.SynchronizationState = 'Unknown'
-                        $state.LastResult = '[WARN] Token validation pending'
-                    }
-                    try { Save-State $state }
-                    catch { Write-Rows @((New-Line 'Saved state' '[FAIL] Could not save status')) }
-                }
-            }
-            if ($apiLines.Count -and $apiLines[-1].Value -eq '[FAIL] Request rejected') { $tokenValidation = '[FAIL] Request rejected' }
-            Write-Rows @((New-Line 'DuckDNS API' $tokenValidation),
+            Write-Rows @((New-Line 'Domain' (Get-DuckDnsDomain $config)),
+                (New-Line 'Credentials' (Get-CredentialsStatus $config $state)),
                 (New-Line 'Initial check' $check.Lines[-1].Value))
         } finally { Exit-RunLock $handle }
         Write-Host ''
@@ -1790,11 +2166,11 @@ function Install-Manager {
 function Show-Dashboard {
     $config = Read-Config
     $state = Read-State
-    if ($state.Domain -and $state.Domain -cne $config.Domain) { $state = New-EmptyState }
+    if ($state.Domain -and $state.Domain -cne (Get-DuckDnsDomain $config)) { $state = New-EmptyState }
     Show-Header ''
     $public = 'Unknown'; if ($state.LastDetectedPublicIPv4) { $public = [string]$state.LastDetectedPublicIPv4 }
     $dns = 'Unknown'; if ($state.DuckDnsIPv4) { $dns = [string]$state.DuckDnsIPv4 }
-    Write-Rows @((New-Line 'Domain' $config.Domain),
+    Write-Rows @((New-Line 'Domain' (Get-DuckDnsDomain $config)),
         (New-Line 'Status' (Get-StatusText $state)),
         (New-Line 'Public IP' $public), (New-Line 'DuckDNS IP' $dns),
         (New-Line 'Last check' (Format-StateTime $state 'LastCheckUtc' $false)))

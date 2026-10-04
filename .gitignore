@@ -2,6 +2,7 @@
 config.json
 config.previous.json
 token.dat
+credentials.dat
 status.json
 status.corrupt-*.json
 run.lock
