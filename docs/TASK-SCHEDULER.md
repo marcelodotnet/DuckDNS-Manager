@@ -83,8 +83,10 @@ the Task Scheduler 300-second hard termination.
 Run on Windows PowerShell 5.1 with administrator access: install all three tasks,
 inspect principal/action/settings, validate and repair a deliberately altered
 task, verify fixed boot delay, reconnect event and indefinite periodic execution,
-confirm SYSTEM can decrypt token.dat, and measure timeout/lock behavior across
-different triggers. These real COM/OS tests have not been executed on Linux.
+confirm SYSTEM can decrypt token.dat and credentials.dat, and measure timeout/lock behavior across
+different triggers. In Specific mode, verify the selected GUID resolves under
+SYSTEM and provider egress uses its current source IPv4; DNS/API still use
+Windows routing. These real COM/OS tests have not been executed on Linux.
 
 ## Native references
 
