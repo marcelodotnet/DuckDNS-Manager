@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$ScriptVersion = '1.2.0'
+$ScriptVersion = '1.2.1'
 $Root = Join-Path $env:ProgramData 'DuckDNS'
 $InstalledScript = Join-Path $Root 'DuckDNS-Manager.ps1'
 $ConfigPath = Join-Path $Root 'config.json'
@@ -872,6 +872,48 @@ function Get-InterfaceFailureRows {
         (New-Line 'Result' '[FAIL] Network interface unavailable'))
 }
 
+function Get-ErrorExceptions($ErrorObject) {
+    $exception = $ErrorObject
+    if ($ErrorObject -is [Management.Automation.ErrorRecord]) { $exception = $ErrorObject.Exception }
+    for ($depth = 0; $depth -lt 10 -and $exception -is [Exception]; $depth++) {
+        $exception
+        $exception = $exception.InnerException
+    }
+}
+
+function Get-SafeRequestFailure($ErrorObject) {
+    $exceptions = @(Get-ErrorExceptions $ErrorObject)
+    foreach ($exception in $exceptions) {
+        if ($exception.PSObject.Properties['Response'] -and $null -ne $exception.Response -and
+            $exception.Response.PSObject.Properties['StatusCode']) {
+            try {
+                $httpCode = [int]$exception.Response.StatusCode
+                if ($httpCode -ge 400 -and $httpCode -le 599) { return ('HTTP ' + $httpCode) }
+            } catch { }
+        }
+    }
+    foreach ($exception in $exceptions) {
+        if ($exception -is [Net.WebException]) {
+            switch ($exception.Status) {
+                'NameResolutionFailure' { return 'API DNS lookup failed' }
+                'ProxyNameResolutionFailure' { return 'Proxy DNS lookup failed' }
+                'ConnectFailure' { return 'Connection failed' }
+                'Timeout' { return 'Request timed out' }
+                'TrustFailure' { return 'Certificate validation failed' }
+                'SecureChannelFailure' { return 'TLS handshake failed' }
+                'ConnectionClosed' { return 'Connection closed' }
+                'SendFailure' { return 'Request send failed' }
+                'ReceiveFailure' { return 'Response receive failed' }
+                'RequestCanceled' { return 'Request canceled' }
+            }
+        }
+        if ($exception -is [Security.Authentication.AuthenticationException]) { return 'TLS handshake failed' }
+        if ($exception -is [TimeoutException]) { return 'Request timed out' }
+    }
+    # Exception messages, URLs, headers and response bodies may contain credentials.
+    return 'Network request failed'
+}
+
 function Invoke-DuckDnsApi($Config, [string]$PublicIP, [bool]$SingleAttempt = $false) {
     $token = $null
     try { $tokenIdentity = Get-TokenFileIdentity; $token = Read-Token }
@@ -882,6 +924,7 @@ function Invoke-DuckDnsApi($Config, [string]$PublicIP, [bool]$SingleAttempt = $f
             '&token=' + [uri]::EscapeDataString($token) + '&ip=' + [uri]::EscapeDataString($PublicIP) + '&verbose=true'
         $attempts = [int]$Config.Retry.Attempts
         if ($SingleAttempt) { $attempts = 1 }
+        $failure = 'Network request failed'
         for ($attempt = 1; $attempt -le $attempts; $attempt++) {
             Assert-Deadline 16
             try {
@@ -894,14 +937,14 @@ function Invoke-DuckDnsApi($Config, [string]$PublicIP, [bool]$SingleAttempt = $f
                     if (@($lines | Where-Object { $_.Trim() -eq 'NOCHANGE' }).Count) { $status = 'NoChange' }
                     return [pscustomobject]@{ Kind = 'Success'; Status = $status; TokenIdentity = $tokenIdentity }
                 }
-                return [pscustomobject]@{ Kind = 'InvalidResponse'; Status = 'InvalidResponse' }
+                return [pscustomobject]@{ Kind = 'InvalidResponse'; Status = 'InvalidResponse'; Failure = 'Unexpected API response' }
             } catch {
                 Assert-Deadline
-                # Never surface the exception: it may contain the token-bearing URL.
+                $failure = Get-SafeRequestFailure $_
                 if ($attempt -lt $attempts) { Wait-Retry ([int]$Config.Retry.DelaySeconds) }
             }
         }
-        return [pscustomobject]@{ Kind = 'Network'; Status = 'Unavailable' }
+        return [pscustomobject]@{ Kind = 'Network'; Status = 'Unavailable'; Failure = $failure }
     } finally {
         $url = $null
         $token = $null
@@ -1061,6 +1104,7 @@ function Invoke-CheckFlow($Config, $State, [string]$RunReason, [bool]$SingleAtte
                 } else {
                     $message = '[FAIL] Request failed'
                     if ($api.Kind -eq 'Rejected') { $message = '[FAIL] Request rejected' }
+                    elseif ($api.PSObject.Properties['Failure']) { $message = '[FAIL] ' + $api.Failure }
                     $lines += New-Line 'DuckDNS API' $message
                     $lines += New-Line 'Result' '[FAIL] DuckDNS update failed'
                     $code = $ExitCodes.Api
@@ -1120,7 +1164,7 @@ function Get-ManagerTaskFolder($Service, [bool]$Create) {
     try { return $Service.GetFolder($TaskFolderName) }
     catch {
         if (-not $Create) { return $null }
-        return $Service.GetFolder('\').CreateFolder('DuckDNS Manager')
+        return $Service.GetFolder('\').CreateFolder('DuckDNS Manager', $null)
     }
 }
 
@@ -1137,9 +1181,9 @@ function Get-TaskEnabled($Config, [string]$Kind) {
 
 function Get-ExpectedAction([string]$Kind) {
     $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $args = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' +
+    $actionArguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' +
         $InstalledScript + '" -Scheduled -Reason ' + $Kind
-    return [pscustomobject]@{ Path = $exe; Arguments = $args }
+    return [pscustomobject]@{ Path = $exe; Arguments = $actionArguments }
 }
 
 function Get-NetworkSubscription {
@@ -1181,7 +1225,7 @@ function New-ManagerTaskDefinition($Service, $Config, [string]$Kind) {
             $trigger = $definition.Triggers.Create(1)
             $trigger.StartBoundary = [DateTime]::Now.AddMinutes([int]$Config.Scheduling.Periodic.IntervalMinutes).ToString('yyyy-MM-ddTHH:mm:ss')
             $trigger.Repetition.Interval = [Xml.XmlConvert]::ToString([TimeSpan]::FromMinutes([int]$Config.Scheduling.Periodic.IntervalMinutes))
-            $trigger.Repetition.Duration = ''
+            # Leave Duration unset: the native default repeats indefinitely.
             $trigger.Repetition.StopAtDurationEnd = $false
         }
     }
@@ -1240,68 +1284,131 @@ function Get-ArgumentSignature([string]$Arguments) {
     return ((@($hostOptions | Sort-Object) -join '|') + '|file=' + $file + '|' + (@($scriptOptions | Sort-Object) -join '|'))
 }
 
-function Test-ManagerTask($Service, $Config, [string]$Kind) {
+function Get-SafeTaskFailure($ErrorObject, [string]$Stage) {
+    $exceptions = @(Get-ErrorExceptions $ErrorObject)
+    foreach ($exception in $exceptions) {
+        if ($exception.Data.Contains('TaskFailure')) { return [string]$exception.Data['TaskFailure'] }
+    }
+    $cause = $exceptions | Select-Object -Last 1
+    $native = @($exceptions | Where-Object { $_ -is [Runtime.InteropServices.COMException] })
+    if ($native.Count) { $cause = $native[-1] }
+    if ($null -eq $cause) { return ($Stage + ' failed') }
+    $code = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$cause.HResult), 0).ToString('X8')
+    $reason = ''
+    switch ($code) {
+        '80070005' { $reason = '; access denied' }
+        '80070057' { $reason = '; invalid argument' }
+        '80070534' { $reason = '; account not resolved' }
+        '80041318' { $reason = '; invalid task definition' }
+        '8004131F' { $reason = '; task already running' }
+    }
+    return ($Stage + ' failed (0x' + $code + $reason + ')')
+}
+
+function Test-ManagerTask($Service, $Config, [string]$Kind, [ref]$Failure = ([ref]$null)) {
+    $healthy = $false
+    $stage = 'Folder'
+    if ($null -ne $Failure) { $Failure.Value = $null }
     try {
         $folder = Get-ManagerTaskFolder $Service $false
         if ($null -eq $folder) { return $false }
+        $stage = 'Task read'
         $task = $folder.GetTask((Get-TaskName $Kind))
         $def = $task.Definition
+        $stage = 'Principal'
         $principal = ([string]$def.Principal.UserId).ToUpperInvariant()
         if ($principal -notin @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18')) { return $false }
         if ([int]$def.Principal.LogonType -ne 5 -or [int]$def.Principal.RunLevel -ne 1) { return $false }
+        $stage = 'Enabled state'
         if ([bool]$task.Enabled -ne (Get-TaskEnabled $Config $Kind) -or
             [bool]$def.Settings.Enabled -ne (Get-TaskEnabled $Config $Kind)) { return $false }
+        $stage = 'Run policy'
         if ([int]$def.Settings.MultipleInstances -ne 2 -or
             -not (Compare-Duration ([string]$def.Settings.ExecutionTimeLimit) 'PT5M')) { return $false }
+        $stage = 'Shared settings'
         if ($def.Settings.DisallowStartIfOnBatteries -or $def.Settings.StopIfGoingOnBatteries -or
             $def.Settings.RunOnlyIfNetworkAvailable -or -not $def.Settings.StartWhenAvailable -or
             $def.Settings.Hidden -or -not $def.Settings.AllowDemandStart -or [int]$def.Settings.RestartCount -ne 0) { return $false }
+        $stage = 'Action count'
         if ([int]$def.Actions.Count -ne 1) { return $false }
+        $stage = 'Action'
         $action = $def.Actions.Item(1)
         $expected = Get-ExpectedAction $Kind
         if ([int]$action.Type -ne 0 -or ([string]$action.Path).Trim('"') -ine $expected.Path -or
             (Get-ArgumentSignature ([string]$action.Arguments)) -cne (Get-ArgumentSignature $expected.Arguments) -or [string]$action.WorkingDirectory) { return $false }
+        $stage = 'Trigger count'
         if ([int]$def.Triggers.Count -ne 1) { return $false }
+        $stage = 'Trigger enabled'
         $trigger = $def.Triggers.Item(1)
         if (-not $trigger.Enabled) { return $false }
         switch ($Kind) {
             'Startup' {
+                $stage = 'Startup delay'
                 $expectedDelay = [Xml.XmlConvert]::ToString([TimeSpan]::FromSeconds([int]$Config.Scheduling.Startup.DelaySeconds))
                 if ([int]$trigger.Type -ne 8 -or -not (Compare-Duration ([string]$trigger.Delay) $expectedDelay)) { return $false }
+                $stage = 'Startup boundaries'
                 if (-not (Test-NoRepetition $trigger) -or [string]$trigger.StartBoundary -or [string]$trigger.EndBoundary) { return $false }
             }
             'Network' {
+                $stage = 'Network subscription'
                 if ([int]$trigger.Type -ne 0 -or (Normalize-Subscription ([string]$trigger.Subscription)) -cne
                     (Normalize-Subscription (Get-NetworkSubscription))) { return $false }
+                $stage = 'Network boundaries'
                 if ([string]$trigger.Delay -or -not (Test-NoRepetition $trigger) -or [string]$trigger.StartBoundary -or [string]$trigger.EndBoundary) { return $false }
             }
             'Periodic' {
+                $stage = 'Periodic repetition'
                 $expectedInterval = [Xml.XmlConvert]::ToString([TimeSpan]::FromMinutes([int]$Config.Scheduling.Periodic.IntervalMinutes))
                 if ([int]$trigger.Type -ne 1 -or -not (Compare-Duration ([string]$trigger.Repetition.Interval) $expectedInterval)) { return $false }
+                $stage = 'Periodic boundaries'
                 if (-not [string]::IsNullOrEmpty([string]$trigger.Repetition.Duration) -or
                     $trigger.Repetition.StopAtDurationEnd -or [string]$trigger.EndBoundary -or
                     [string]$trigger.RandomDelay) { return $false }
+                $stage = 'Periodic start'
                 $boundary = [DateTime]::MinValue
                 if (-not [DateTime]::TryParse([string]$trigger.StartBoundary, [ref]$boundary)) { return $false }
                 if ($boundary -gt [DateTime]::Now.AddMinutes([int]$Config.Scheduling.Periodic.IntervalMinutes + 1)) { return $false }
             }
         }
+        $healthy = $true
         return $true
-    } catch { return $false }
+    } catch {
+        if ($null -ne $Failure) { $Failure.Value = Get-SafeTaskFailure $_ $stage }
+        return $false
+    } finally {
+        if (-not $healthy -and $null -ne $Failure -and -not $Failure.Value) { $Failure.Value = $stage + ' mismatch' }
+    }
 }
 
 function Set-ManagerTask($Service, $Config, [string]$Kind) {
-    $folder = Get-ManagerTaskFolder $Service $true
-    $definition = New-ManagerTaskDefinition $Service $Config $Kind
-    [void]$folder.RegisterTaskDefinition((Get-TaskName $Kind), $definition, 6, 'SYSTEM', $null, 5, $null)
-    if (-not (Test-ManagerTask $Service $Config $Kind)) { throw 'Scheduled task verification failed.' }
+    $stage = 'Folder'
+    try {
+        $folder = Get-ManagerTaskFolder $Service $true
+        $stage = 'Definition'
+        $definition = New-ManagerTaskDefinition $Service $Config $Kind
+        $stage = 'Registration'
+        [void]$folder.RegisterTaskDefinition((Get-TaskName $Kind), $definition, 6, 'SYSTEM', $null, 5, $null)
+        $stage = 'Verification'
+        $failure = $null
+        if (-not (Test-ManagerTask $Service $Config $Kind ([ref]$failure))) {
+            $exception = New-Object InvalidOperationException 'Scheduled task verification failed.'
+            $exception.Data['TaskFailure'] = 'Verification: ' + $failure
+            throw $exception
+        }
+    } catch {
+        if (-not $_.Exception.Data.Contains('TaskFailure')) {
+            $_.Exception.Data['TaskFailure'] = Get-SafeTaskFailure $_ $stage
+        }
+        throw
+    }
 }
 
 function Repair-ManagerTasks($Config, [string[]]$Kinds = $TaskNames) {
     $results = @()
     try { $service = Get-TaskService }
     catch {
-        foreach ($kind in $Kinds) { $results += [pscustomobject]@{ Kind = $kind; Result = '[FAIL] Task Scheduler unavailable' } }
+        $failure = Get-SafeTaskFailure $_ 'Task Scheduler connection'
+        foreach ($kind in $Kinds) { $results += [pscustomobject]@{ Kind = $kind; Result = '[FAIL] ' + $failure } }
         return $results
     }
     foreach ($kind in $Kinds) {
@@ -1310,7 +1417,7 @@ function Repair-ManagerTasks($Config, [string[]]$Kinds = $TaskNames) {
             if (-not (Get-TaskEnabled $Config $kind)) { $result = '[SKIP] Disabled by configuration' }
         } else {
             try { Set-ManagerTask $service $Config $kind; $result = '[OK] Repaired' }
-            catch { $result = '[FAIL] Could not repair task' }
+            catch { $result = '[FAIL] ' + (Get-SafeTaskFailure $_ 'Task repair') }
         }
         $results += [pscustomobject]@{ Kind = $kind; Result = $result }
     }
@@ -1368,7 +1475,7 @@ function Set-ConfigValue([string]$Key, $Value, [string]$TaskKind = '') {
         if ($TaskKind) {
             $taskResult = @(Repair-ManagerTasks $config @($TaskKind))[0]
             if ($taskResult.Result.StartsWith('[FAIL]')) {
-                return @((New-Line 'Setting' '[OK] Saved'), (New-Line ($TaskKind + ' task') '[FAIL] Needs repair'))
+                return @((New-Line 'Setting' '[OK] Saved'), (New-Line ($TaskKind + ' task') $taskResult.Result))
             }
             return @((New-Line 'Setting' '[OK] Saved'), (New-Line ($TaskKind + ' task') '[OK] Updated'))
         }
@@ -2140,6 +2247,7 @@ function Install-Manager {
             Protect-Runtime
             $taskResults = @(Repair-ManagerTasks $config)
             if (@($taskResults | Where-Object { $_.Result.StartsWith('[FAIL]') }).Count) {
+                foreach ($item in $taskResults) { Write-Rows @((New-Line ($item.Kind + ' task') $item.Result)) }
                 throw 'Scheduled task installation failed.'
             }
             Write-Rows @((New-Line 'Installing' '[OK]'), (New-Line 'Scheduled tasks' '[OK] 3 configured'))
