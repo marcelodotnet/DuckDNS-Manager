@@ -72,6 +72,14 @@ Repair preserves a healthy task; otherwise it creates/replaces the definition
 and verifies the result. Registration uses CREATE_OR_UPDATE (6), SYSTEM and
 ServiceAccount (5). A failure remains visible as Needs repair.
 
+Folder creation explicitly supplies both COM arguments, including an empty
+security descriptor. The periodic repetition Duration is left unset to preserve
+the native indefinite default. Repair failures report the operation (Folder,
+Definition, Registration or Verification) and HRESULT when an exception occurs.
+Verification failures identify the mismatched setting group. Raw exception
+messages are not displayed. Installation and scheduling changes also show these
+task diagnostics when reconciliation fails.
+
 IgnoreNew only prevents concurrent instances of the same task. Different tasks
 and manual runs still share the exclusive run.lock. A competing run exits 0
 without changing saved state. Setup retains this lock through its first check.
@@ -93,3 +101,4 @@ Windows routing. These real COM/OS tests have not been executed on Linux.
 - [BootTrigger.Delay](https://learn.microsoft.com/en-us/windows/win32/taskschd/boottrigger-delay)
 - [RepetitionPattern.Duration](https://learn.microsoft.com/en-us/windows/win32/taskschd/repetitionpattern-duration)
 - [ITaskFolder.RegisterTaskDefinition](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/nf-taskschd-itaskfolder-registertaskdefinition)
+- [TaskFolder.CreateFolder](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskfolder-createfolder)

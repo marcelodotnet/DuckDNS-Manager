@@ -2,7 +2,7 @@
 
 ## Architecture and compatibility
 
-Version 1.2.0 is one primary ASCII-only PowerShell script targeting Windows
+Version 1.2.1 is one primary ASCII-only PowerShell script targeting Windows
 PowerShell 5.1 and .NET Framework. Native COM Task Scheduler, DPAPI, filesystem
 ACLs, Resolve-DnsName and HTTPS implement the runtime. No service, GUI, modules,
 IPv6 updater, multiple profiles or internet self-updater are included.
@@ -211,6 +211,11 @@ Scheduler's PT5M is the final hard stop, not the normal timeout path.
 Configuration/token/public-IP/DNS/API/state errors have dedicated codes 10-15;
 unexpected failures use 99. State access/persistence failure takes precedence
 when the result cannot be saved. Propagation pending and execution skips use 0.
+
+API failures expose only fixed transport categories or numeric HTTP status codes.
+Nested exceptions are inspected without copying their messages, URLs, headers
+or response bodies. Task repair reports the failing operation and native HRESULT;
+post-registration validation identifies the mismatched setting group.
 
 ## Security and atomic writes
 
