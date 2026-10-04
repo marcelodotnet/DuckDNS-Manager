@@ -1,18 +1,38 @@
 {
-  "SchemaVersion": 2,
-  "Domain": "example.duckdns.org",
+  "SchemaVersion": 3,
+  "Hostname": "example",
+  "NetworkInterface": {
+    "Mode": "Automatic",
+    "InterfaceGuid": null
+  },
   "CompareIpBeforeUpdate": true,
   "PostUpdateValidation": true,
   "Dns": {
     "Mode": "System",
     "ManualServer": null
   },
-  "Retry": { "Attempts": 6, "DelaySeconds": 5 },
-  "ForcedUpdate": { "Enabled": false, "IntervalHours": 24 },
-  "Scheduling": {
-    "Startup": { "Enabled": true, "DelaySeconds": 20 },
-    "NetworkReconnect": { "Enabled": true },
-    "Periodic": { "Enabled": true, "IntervalMinutes": 30 }
+  "Retry": {
+    "Attempts": 6,
+    "DelaySeconds": 5
   },
-  "Logging": { "Enabled": false }
+  "ForcedUpdate": {
+    "Enabled": false,
+    "IntervalHours": 24
+  },
+  "Scheduling": {
+    "Startup": {
+      "Enabled": true,
+      "DelaySeconds": 20
+    },
+    "NetworkReconnect": {
+      "Enabled": true
+    },
+    "Periodic": {
+      "Enabled": true,
+      "IntervalMinutes": 30
+    }
+  },
+  "Logging": {
+    "Enabled": false
+  }
 }
