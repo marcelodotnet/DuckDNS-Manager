@@ -187,7 +187,7 @@ try {
         $script:failReceipt = $false
         $script:apiCalls = 0
         function Invoke-DuckDnsApi($Config,$PublicIP,$SingleAttempt) {
-            $script:apiCalls++; return [pscustomobject]@{Kind=$script:apiKind;Status='NoChange';TokenIdentity=(Get-TokenFileIdentity)}
+            $script:apiCalls++; return [pscustomobject]@{Kind=$script:apiKind;Status='NoChange';TokenIdentity=(Get-TokenFileIdentity);Failure=$script:apiFailure}
         }
         function Resolve-HostA { return [pscustomobject]@{Success=$true;Addresses=@('8.8.8.8');Resolver='Windows';IsFallback=$false} }
         $script:apiKind = 'Success'; $state = New-EmptyState
@@ -218,6 +218,18 @@ try {
         function Resolve-HostA { return [pscustomobject]@{Success=$false;Addresses=@();Resolver=$null;IsFallback=$false} }
         $result = Complete-Check $config $state 'Manual'
         Assert ($result.ExitCode -eq 13 -and $script:apiCalls -eq 1) 'DNS comparison failure blocks credential validation and updates'
+        $config.NetworkInterface.Mode = 'Automatic'; $config.NetworkInterface.InterfaceGuid = $null
+        function Resolve-HostA { return [pscustomobject]@{Success=$true;Addresses=@('8.8.8.8');Resolver='Windows';IsFallback=$false} }
+        $script:apiKind = 'Network'
+        $protectedTokenBefore = [Convert]::ToBase64String([IO.File]::ReadAllBytes($TokenPath))
+        foreach ($apiFailure in @('HTTP 403','TLS handshake failed','Request timed out')) {
+            $script:apiFailure = $apiFailure; $state = New-EmptyState
+            $result = Complete-Check $config $state 'Manual'
+            Assert ($result.ExitCode -eq 14 -and @($result.Lines | Where-Object { $_.Label -eq 'DuckDNS API' -and $_.Value -eq ('[FAIL] ' + $apiFailure) }).Count -eq 1) ('update screen displays safe API failure: ' + $apiFailure)
+            Assert ((Get-CredentialsStatus $config $state) -eq '[WARN] Protected; verification pending' -and
+                [Convert]::ToBase64String([IO.File]::ReadAllBytes($TokenPath)) -eq $protectedTokenBefore) ('API diagnostic preserves pending credentials and protected token: ' + $apiFailure)
+        }
+        $script:apiFailure = $null
     } finally { Exit-RunLock $handle }
     # Execute setup/edit workflows with mock input and mock Windows boundaries.
     $script:consoleLines = @(); $script:choices = [Collections.Queue]::new()

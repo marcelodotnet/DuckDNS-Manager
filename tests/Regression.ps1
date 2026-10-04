@@ -194,6 +194,42 @@ try {
     Assert ((& $realApi $config '8.8.8.8' $true).Kind -eq 'Rejected') 'mock API explicit rejection'
     $script:apiBody = 'unrecognized'
     Assert ((& $realApi $config '8.8.8.8' $true).Kind -eq 'InvalidResponse') 'mock API malformed response is not credential rejection'
+    Assert ((& $realApi $config '8.8.8.8' $true).Failure -eq 'Unexpected API response') 'malformed response has a safe diagnostic'
+    foreach ($case in @(
+        @('NameResolutionFailure','API DNS lookup failed'),
+        @('ProxyNameResolutionFailure','Proxy DNS lookup failed'),
+        @('ConnectFailure','Connection failed'),
+        @('Timeout','Request timed out'),
+        @('TrustFailure','Certificate validation failed'),
+        @('SecureChannelFailure','TLS handshake failed'),
+        @('ConnectionClosed','Connection closed'),
+        @('SendFailure','Request send failed'),
+        @('ReceiveFailure','Response receive failed'),
+        @('RequestCanceled','Request canceled')
+    )) {
+        $script:apiException = [Net.WebException]::new('SECRET-FIXTURE-URL', [Net.WebExceptionStatus]$case[0])
+        function Invoke-WebRequest { throw $script:apiException }
+        $apiResult = & $realApi $config '8.8.8.8' $true
+        Assert ($apiResult.Kind -eq 'Network' -and $apiResult.Failure -eq $case[1]) ('API transport diagnostic: ' + $case[0])
+        Assert (($apiResult | ConvertTo-Json -Compress) -notmatch 'SECRET-FIXTURE') ('API diagnostic hides exception text: ' + $case[0])
+    }
+    $unknownException = [Exception]::new('SECRET-FIXTURE-URL')
+    Assert ((Get-SafeRequestFailure $unknownException) -eq 'Network request failed') 'unknown request error has no raw text'
+    $tlsException = [Security.Authentication.AuthenticationException]::new('SECRET-FIXTURE-URL')
+    $wrappedTls = [Reflection.TargetInvocationException]::new('SECRET-FIXTURE-WRAPPER',$tlsException)
+    Assert ((Get-SafeRequestFailure $wrappedTls) -eq 'TLS handshake failed') 'wrapped TLS failure classified without message'
+    Add-Type -TypeDefinition @'
+public sealed class DuckDnsTestHttpResponse { public int StatusCode { get; set; } }
+public sealed class DuckDnsTestHttpException : System.Exception {
+    public DuckDnsTestHttpResponse Response { get; private set; }
+    public DuckDnsTestHttpException(int code) : base("SECRET-FIXTURE-URL") {
+        Response = new DuckDnsTestHttpResponse { StatusCode = code };
+    }
+}
+'@
+    foreach ($httpCode in @(403,429,503)) {
+        Assert ((Get-SafeRequestFailure ([DuckDnsTestHttpException]::new($httpCode))) -eq ('HTTP ' + $httpCode)) ('HTTP response diagnostic: ' + $httpCode)
+    }
     function New-FakeCollection([bool]$Triggers) {
         $collection = [pscustomobject]@{ Items = [Collections.ArrayList]::new(); Count = 0; IsTrigger = $Triggers }
         $collection | Add-Member -MemberType ScriptMethod -Name Create -Value {
@@ -224,6 +260,9 @@ try {
     $folder | Add-Member -MemberType ScriptMethod -Name GetTask -Value { param($name) return $script:fakeTask }
     $folder | Add-Member -MemberType ScriptMethod -Name RegisterTaskDefinition -Value {
         param($name,$definition,$flags,$user,$password,$logon,$sddl)
+        if ($flags -ne 6 -or $user -ne 'SYSTEM' -or $null -ne $password -or $logon -ne 5 -or $null -ne $sddl) {
+            throw 'Incorrect registration arguments.'
+        }
         $script:fakeTask = [pscustomobject]@{Definition=$definition;Enabled=$definition.Settings.Enabled}
         return 0
     }
@@ -250,6 +289,51 @@ try {
     $config.Scheduling.Periodic.Enabled = $false
     Set-ManagerTask $service $config 'Periodic'
     Assert (Test-ManagerTask $service $config 'Periodic') 'configured disabled task healthy'
+    $rootFolder = [pscustomobject]@{Child=$folder}
+    $rootFolder | Add-Member -MemberType ScriptMethod -Name CreateFolder -Value {
+        param($name,$sddl)
+        if (-not $PSBoundParameters.ContainsKey('sddl') -or $name -ne 'DuckDNS Manager' -or $null -ne $sddl) {
+            throw 'CreateFolder requires two arguments with an empty security descriptor.'
+        }
+        $script:folderCreates++
+        $script:folderExists = $true
+        return $this.Child
+    }
+    $newService = [pscustomobject]@{Folder=$folder;RootFolder=$rootFolder}
+    $newService | Add-Member -MemberType ScriptMethod -Name NewTask -Value { param($flags) return (New-FakeDefinition) }
+    $newService | Add-Member -MemberType ScriptMethod -Name GetFolder -Value {
+        param($name)
+        if ($name -eq '\') { return $this.RootFolder }
+        if (-not $script:folderExists) { throw [Runtime.InteropServices.COMException]::new('SECRET-FIXTURE-TASK',-2147024894) }
+        return $this.Folder
+    }
+    $script:folderCreates = 0; $script:folderExists = $false
+    $script:fakeTask = $null
+    Set-ManagerTask $newService $config 'Startup'
+    Assert ($script:folderCreates -eq 1 -and (Test-ManagerTask $newService $config 'Startup')) 'fresh task folder supplies required COM security descriptor argument'
+    Set-ManagerTask $newService $config 'Network'
+    Assert ($script:folderCreates -eq 1) 'existing task folder reused without creation'
+    $failure = $null
+    $script:fakeTask.Definition.Actions.Item(1).Arguments = '-NoProfile'
+    Assert (-not (Test-ManagerTask $newService $config 'Network' ([ref]$failure)) -and $failure -eq 'Action mismatch') 'post-registration validation identifies altered action'
+    function Get-TaskService { return $script:newService }
+    $folder | Add-Member -Force -MemberType ScriptMethod -Name RegisterTaskDefinition -Value {
+        param($name,$definition,$flags,$user,$password,$logon,$sddl)
+        throw [Runtime.InteropServices.COMException]::new('SECRET-FIXTURE-TASK',-2147024891)
+    }
+    $repairResults = @(Repair-ManagerTasks $config)
+    Assert ($repairResults.Count -eq 3 -and @($repairResults | Where-Object { $_.Result -eq '[FAIL] Registration failed (0x80070005; access denied)' }).Count -eq 3) 'repair reports native registration HRESULT for every affected task'
+    Assert (($repairResults | ConvertTo-Json -Compress) -notmatch 'SECRET-FIXTURE') 'task diagnostics never display raw exception text'
+    $folder | Add-Member -Force -MemberType ScriptMethod -Name RegisterTaskDefinition -Value {
+        param($name,$definition,$flags,$user,$password,$logon,$sddl)
+        $definition.Settings.MultipleInstances = 0
+        $script:fakeTask = [pscustomobject]@{Definition=$definition;Enabled=$definition.Settings.Enabled}
+    }
+    $repairResults = @(Repair-ManagerTasks $config @('Startup'))
+    Assert ($repairResults[0].Result -eq '[FAIL] Verification: Run policy mismatch') 'registration success with invalid persisted definition is distinguished from COM failure'
+    function Get-TaskService { throw [Runtime.InteropServices.COMException]::new('SECRET-FIXTURE-TASK',-2147024891) }
+    $repairResults = @(Repair-ManagerTasks $config)
+    Assert ($repairResults.Count -eq 3 -and $repairResults[0].Result -eq '[FAIL] Task Scheduler connection failed (0x80070005; access denied)') 'task connection failure exposes safe native diagnostic'
     # A recent failed check must not be debounced; skips must not write status.
     function Read-Config { return $script:config }
     function Complete-Check($Config,$State,$Reason) { $script:checkCalls++; return [pscustomobject]@{Lines=@();ExitCode=0} }
