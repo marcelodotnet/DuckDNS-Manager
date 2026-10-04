@@ -28,8 +28,8 @@ try {
     [void][IO.Directory]::CreateDirectory($Root)
     $realMigration = ${function:Migrate-Config}
     function Migrate-Config { }
-    Assert ((Normalize-Domain ' EXAMPLE.DUCKDNS.ORG ') -eq 'example.duckdns.org') 'domain normalization'
-    Assert ((Normalize-Domain 'test-name') -eq 'test-name.duckdns.org') 'subdomain normalization'
+    Assert ((Normalize-Hostname ' EXAMPLE.DUCKDNS.ORG ') -eq 'example') 'hostname normalization'
+    Assert ((Normalize-Hostname 'test-name') -eq 'test-name') 'bare hostname normalization'
     $invalid = $false
     try { [void](Normalize-Domain 'https://example.duckdns.org') } catch { $invalid = $true }
     Assert $invalid 'invalid domain rejected'
@@ -37,18 +37,24 @@ try {
     foreach ($ip in @('192.168.1.1','127.0.0.1','100.64.0.1','203.0.113.42','01.2.3.4','256.1.1.1','::1')) {
         Assert (-not (Test-IPv4 $ip $true)) ('invalid/nonpublic IPv4: ' + $ip)
     }
-    $config = New-DefaultConfig; $config.Domain = 'example.duckdns.org'
+    function New-LegacyFixture($Config) {
+        $fixture = $Config | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+        $fixture | Add-Member -NotePropertyName Domain -NotePropertyValue (Get-DuckDnsDomain $Config)
+        $fixture.PSObject.Properties.Remove('Hostname'); $fixture.PSObject.Properties.Remove('NetworkInterface')
+        return $fixture
+    }
+    $config = New-DefaultConfig; $config.Hostname = 'example'
     Assert-Config $config
-    Assert ($config.SchemaVersion -eq 2 -and $config.Dns.Mode -eq 'System') 'schema 2 defaults'
-    $v1 = $config | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+    Assert ($config.SchemaVersion -eq 3 -and $config.Dns.Mode -eq 'System') 'schema 3 defaults'
+    $v1 = New-LegacyFixture $config
     $v1.PSObject.Properties.Remove('Dns'); $v1.SchemaVersion = 1
     $v1 | Add-Member -NotePropertyName ValidationDns -NotePropertyValue '1.1.1.1'
-    $v2 = Convert-ConfigV2 $v1
+    $v2 = Convert-ConfigV3 $v1
     Assert ($v2.Dns.Mode -eq 'System' -and $null -eq $v2.Dns.ManualServer) 'default v1 migration'
-    $v1 = $config | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+    $v1 = New-LegacyFixture $config
     $v1.PSObject.Properties.Remove('Dns'); $v1.SchemaVersion = 1
     $v1 | Add-Member -NotePropertyName ValidationDns -NotePropertyValue '192.168.1.1'
-    $v2 = Convert-ConfigV2 $v1
+    $v2 = Convert-ConfigV3 $v1
     Assert ($v2.Dns.Mode -eq 'Manual' -and $v2.Dns.ManualServer -eq '192.168.1.1') 'custom v1 migration'
     Assert (@(Get-ResolverChain $config).Count -eq 1 -and @(Get-ResolverChain $config)[0] -eq 'Windows') 'system DNS only'
     $config.Dns.Mode = 'Manual'; $config.Dns.ManualServer = '192.168.1.1'
@@ -77,14 +83,14 @@ try {
     try {
         $other = Enter-RunLock
         Assert ($null -eq $other) 'exclusive lock contention'
-        $legacyFixture = $config | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+        $legacyFixture = New-LegacyFixture $config
         $legacyFixture.SchemaVersion = 1; $legacyFixture.PSObject.Properties.Remove('Dns')
         $legacyFixture | Add-Member -NotePropertyName ValidationDns -NotePropertyValue '192.168.1.1'
         Write-AtomicJson $ConfigPath $legacyFixture
         & $realMigration
         $migrated = Get-Content $ConfigPath -Raw | ConvertFrom-Json
         $migrationBackup = Get-Content $PreviousConfigPath -Raw | ConvertFrom-Json
-        Assert ($migrated.SchemaVersion -eq 2 -and $migrationBackup.SchemaVersion -eq 1) 'migration atomically preserves v1 backup'
+        Assert ($migrated.SchemaVersion -eq 3 -and $migrationBackup.SchemaVersion -eq 1) 'migration atomically preserves v1 backup'
         Save-Config $config
         $config.ForcedUpdate.Enabled = $true
         Save-Config $config
@@ -121,6 +127,8 @@ try {
         $script:InternalLimitSeconds = 240; $script:RunClock = $null
         $script:apiCalls = 0; $script:confirmCalls = 0
         function Test-TokenLocal { return $true }
+        function Get-CredentialsStatus { return '[OK] Protected and verified' }
+        function Set-CredentialOutcome { }
         function Find-PublicIPv4 { return [pscustomobject]@{ IP='8.8.8.8'; Results=@() } }
         function Resolve-HostA { return [pscustomobject]@{Success=$true;Addresses=@('8.8.8.8');Resolver='Windows';IsFallback=$false} }
         function Confirm-PublicIPv4 { $script:confirmCalls++; return [pscustomobject]@{IP='8.8.8.8';Results=@()} }
@@ -174,6 +182,7 @@ try {
 
     Assert (Test-NoAError ([pscustomobject]@{FullyQualifiedErrorId='DNS_INFO_NO_RECORDS,ResolveDnsName';Exception=[Exception]::new()})) 'no-A response classification'
     Assert (-not (Test-NoAError ([pscustomobject]@{FullyQualifiedErrorId='ERROR_TIMEOUT,ResolveDnsName';Exception=[Exception]::new()}))) 'resolver timeout classification'
+    function Get-TokenFileIdentity { return 'mock-ciphertext-identity' }
     function Read-Token { return 'TEST-FIXTURE-NOT-A-CREDENTIAL' }
     function Invoke-WebRequest { return [pscustomobject]@{Content=$script:apiBody} }
     $script:RunClock = $null
@@ -221,7 +230,7 @@ try {
     $service = [pscustomobject]@{Folder=$folder}
     $service | Add-Member -MemberType ScriptMethod -Name NewTask -Value { param($flags) return (New-FakeDefinition) }
     $service | Add-Member -MemberType ScriptMethod -Name GetFolder -Value { param($name) return $this.Folder }
-    $config = New-DefaultConfig; $config.Domain = 'example.duckdns.org'
+    $config = New-DefaultConfig; $config.Hostname = 'example'
     foreach ($kind in @('Startup','Network','Periodic')) {
         $definition = New-ManagerTaskDefinition $service $config $kind
         $script:fakeTask = [pscustomobject]@{Definition=$definition;Enabled=$definition.Settings.Enabled}
@@ -247,7 +256,7 @@ try {
     $script:checkCalls = 0
     $handle = Enter-RunLock
     try {
-        $state = New-EmptyState; $state.Domain = $config.Domain
+        $state = New-EmptyState; $state.Domain = Get-DuckDnsDomain $config
         $state.LastCheckUtc = [DateTime]::UtcNow.ToString('o')
         $state.LastSuccessfulCheckUtc = [DateTime]::UtcNow.ToString('o')
         Save-State $state
