@@ -2,7 +2,7 @@
 
 ## Architecture and compatibility
 
-Version 1.2.1 is one primary ASCII-only PowerShell script targeting Windows
+Version 1.3.0 is one primary ASCII-only PowerShell script targeting Windows
 PowerShell 5.1 and .NET Framework. Native COM Task Scheduler, DPAPI, filesystem
 ACLs, Resolve-DnsName and HTTPS implement the runtime. No service, GUI, modules,
 IPv6 updater, multiple profiles or internet self-updater are included.
@@ -187,6 +187,10 @@ Normal discovery checks ipify, icanhazip and Amazon sequentially until a valid I
    but further provider confirmation/API calls are suppressed for five minutes.
 6. Parse API OK, NOCHANGE or explicit KO. Malformed output is an API failure,
    not proof of credential rejection. HTTP exceptions remain sanitized.
+   Decode byte-array response content as UTF-8 before parsing, including when
+   Windows PowerShell receives no Content-Type header. Strip an optional UTF-8
+   byte-order mark and accept LF, CRLF or CR line endings. Empty/HTML responses
+   remain invalid; their bodies are not displayed or persisted.
 7. Validation off records Accepted. Validation on polls DNS up to three times:
    matching IPv4 records Synchronized; otherwise records Pending.
 8. Finalize timestamps/failure count and atomically persist state.
@@ -196,6 +200,15 @@ persistence and real verification. Matching DNS still allows one validation
 request for a pending pair. DNS comparison failure blocks it. The protected
 token is retained after network failure/rejection. Post-update validation off
 always reports Accepted, including an accepted credential validation call.
+
+Interactive opening performs a separate read-only observation before the first
+dashboard: public IPv4 discovery respects interface selection, and A-record
+resolution respects DNS selection even when update comparison is disabled. The
+in-memory result supplies current addresses, comparison status and observation
+time without calling the API or changing credentials/saved history. Failed reads
+do not reuse saved addresses. A hostname/interface/DNS configuration key prevents
+displaying observations for changed settings, and a subsequent update check
+clears the observation. Scheduled entry bypasses this opening check.
 
 ## Time budget and errors
 
@@ -221,7 +234,10 @@ post-registration validation identifies the mismatched setting group.
 
 DPAPI LocalMachine protects token.dat and credentials.dat, and the runtime ACL permits SYSTEM and
 BUILTIN Administrators. Runtime ACL diagnostics verify protected access rules
-on the directory, token and receipt when present. Local administrators remain trusted; this is not a
+on the directory, token and receipt when present. They identify the affected item
+and distinguish enabled inheritance, unexpected allow rules, denied/incomplete
+trusted permissions, missing trusted principals and sanitized read errors.
+Local administrators remain trusted; this is not a
 boundary against an administrator of the computer.
 
 The application never prints/logs the token or complete update URL. HTTP

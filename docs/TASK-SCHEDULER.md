@@ -30,7 +30,7 @@ The event subscription is:
 
 | Setting | Value |
 | --- | --- |
-| Principal | SYSTEM / NT AUTHORITY\SYSTEM / S-1-5-18 |
+| Principal | SYSTEM SID S-1-5-18 |
 | Logon type | ServiceAccount (5) |
 | Run level | Highest (1) |
 | MultipleInstancesPolicy | IgnoreNew (2) |
@@ -67,10 +67,13 @@ Durations are parsed as TimeSpan values. Event subscriptions are parsed and
 normalized for their channel/event filter. Action arguments tolerate equivalent
 whitespace, quoting and supported option ordering. Irrelevant exported XML
 formatting/element ordering does not make a task unhealthy.
+Principal validation accepts the SYSTEM SID, known SYSTEM aliases and localized
+account names that translate to S-1-5-18. Other or unresolvable accounts fail.
 
 Repair preserves a healthy task; otherwise it creates/replaces the definition
-and verifies the result. Registration uses CREATE_OR_UPDATE (6), SYSTEM and
-ServiceAccount (5). A failure remains visible as Needs repair.
+and verifies the result. Registration uses CREATE_OR_UPDATE (6), S-1-5-18 and
+ServiceAccount (5). Health rows report the failing setting group or a sanitized
+native error instead of only Needs repair.
 
 Folder creation explicitly supplies both COM arguments, including an empty
 security descriptor. The periodic repetition Duration is left unset to preserve
