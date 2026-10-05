@@ -190,6 +190,22 @@ try {
     Assert ((& $realApi $config '8.8.8.8' $true).Kind -eq 'Success') 'mock API acceptance'
     $script:apiBody = "OK`n8.8.8.8`nNOCHANGE"
     Assert ((& $realApi $config '8.8.8.8' $true).Status -eq 'NoChange') 'mock API no-change'
+    $script:apiBody = [Text.Encoding]::UTF8.GetBytes("OK`n8.8.8.8`n`nNOCHANGE")
+    Assert ((& $realApi $config '8.8.8.8' $true).Status -eq 'NoChange') 'API byte-array response decoded before parsing'
+    $script:apiBody = [Text.Encoding]::UTF8.GetBytes("OK`n8.8.8.8`n`nUPDATED")
+    Assert ((& $realApi $config '8.8.8.8' $true).Status -eq 'Updated') 'API byte-array update accepted'
+    $script:apiBody = [Text.Encoding]::UTF8.GetBytes('KO')
+    $apiResult = & $realApi $config '8.8.8.8' $true
+    Assert ($apiResult.Kind -eq 'Rejected' -and $apiResult.TokenIdentity -eq 'mock-ciphertext-identity') 'API byte-array rejection retains current credential identity'
+    $script:apiBody = [byte[]](@(239,187,191) + [Text.Encoding]::UTF8.GetBytes("OK`r`n8.8.8.8`r`n`r`nNOCHANGE`r`n"))
+    Assert ((& $realApi $config '8.8.8.8' $true).Status -eq 'NoChange') 'API UTF-8 byte-order mark and CRLF accepted'
+    $script:apiBody = [string][char]0xFEFF + "OK`r8.8.8.8`r`rUPDATED"
+    Assert ((& $realApi $config '8.8.8.8' $true).Status -eq 'Updated') 'API text byte-order mark and CR line endings accepted'
+    $script:apiBody = [byte[]]@()
+    Assert ((& $realApi $config '8.8.8.8' $true).Kind -eq 'InvalidResponse') 'API empty byte-array response never verifies credentials'
+    $script:apiBody = [Text.Encoding]::UTF8.GetBytes("<html>SECRET-FIXTURE-URL`nOK`n</html>")
+    $apiResult = & $realApi $config '8.8.8.8' $true
+    Assert ($apiResult.Kind -eq 'InvalidResponse' -and ($apiResult | ConvertTo-Json -Compress) -notmatch 'SECRET-FIXTURE') 'API HTML byte-array response rejected without exposing its body'
     $script:apiBody = 'KO'
     Assert ((& $realApi $config '8.8.8.8' $true).Kind -eq 'Rejected') 'mock API explicit rejection'
     $script:apiBody = 'unrecognized'
@@ -260,7 +276,7 @@ public sealed class DuckDnsTestHttpException : System.Exception {
     $folder | Add-Member -MemberType ScriptMethod -Name GetTask -Value { param($name) return $script:fakeTask }
     $folder | Add-Member -MemberType ScriptMethod -Name RegisterTaskDefinition -Value {
         param($name,$definition,$flags,$user,$password,$logon,$sddl)
-        if ($flags -ne 6 -or $user -ne 'SYSTEM' -or $null -ne $password -or $logon -ne 5 -or $null -ne $sddl) {
+        if ($flags -ne 6 -or $user -ne 'S-1-5-18' -or $null -ne $password -or $logon -ne 5 -or $null -ne $sddl) {
             throw 'Incorrect registration arguments.'
         }
         $script:fakeTask = [pscustomobject]@{Definition=$definition;Enabled=$definition.Settings.Enabled}
@@ -274,7 +290,7 @@ public sealed class DuckDnsTestHttpException : System.Exception {
         $definition = New-ManagerTaskDefinition $service $config $kind
         $script:fakeTask = [pscustomobject]@{Definition=$definition;Enabled=$definition.Settings.Enabled}
         Assert (Test-ManagerTask $service $config $kind) ('task semantic validation: '+$kind)
-        Assert ($definition.Principal.UserId -eq 'SYSTEM' -and $definition.Settings.ExecutionTimeLimit -eq 'PT5M' -and
+        Assert ($definition.Principal.UserId -eq 'S-1-5-18' -and $definition.Settings.ExecutionTimeLimit -eq 'PT5M' -and
             $definition.Settings.MultipleInstances -eq 2) ('task principal and limits: '+$kind)
         if ($kind -eq 'Startup') { Assert ($definition.Triggers.Item(1).Delay -eq 'PT20S') 'fixed boot delay' }
         if ($kind -eq 'Periodic') {
@@ -289,6 +305,18 @@ public sealed class DuckDnsTestHttpException : System.Exception {
     $config.Scheduling.Periodic.Enabled = $false
     Set-ManagerTask $service $config 'Periodic'
     Assert (Test-ManagerTask $service $config 'Periodic') 'configured disabled task healthy'
+    foreach ($principal in @('SYSTEM','NT AUTHORITY\SYSTEM','S-1-5-18')) {
+        Assert (Test-SystemTaskPrincipal $principal) ('known SYSTEM identity: ' + $principal)
+    }
+    function Resolve-WindowsAccountSid($AccountName) {
+        if ($AccountName -eq 'LOCALIZED-SYSTEM-FIXTURE') { return 'S-1-5-18' }
+        if ($AccountName -eq 'ADMINISTRATORS-FIXTURE') { return 'S-1-5-32-544' }
+        throw 'SECRET-FIXTURE-IDENTITY'
+    }
+    Assert (Test-SystemTaskPrincipal 'LOCALIZED-SYSTEM-FIXTURE') 'localized task principal resolved to SYSTEM SID'
+    Assert (-not (Test-SystemTaskPrincipal 'ADMINISTRATORS-FIXTURE')) 'administrators group cannot stand in for SYSTEM task principal'
+    Assert (-not (Test-SystemTaskPrincipal 'UNKNOWN-FIXTURE')) 'unresolvable task principal rejected'
+    Assert (-not (Test-SystemTaskPrincipal '')) 'empty task principal rejected'
     $rootFolder = [pscustomobject]@{Child=$folder}
     $rootFolder | Add-Member -MemberType ScriptMethod -Name CreateFolder -Value {
         param($name,$sddl)
@@ -331,9 +359,49 @@ public sealed class DuckDnsTestHttpException : System.Exception {
     }
     $repairResults = @(Repair-ManagerTasks $config @('Startup'))
     Assert ($repairResults[0].Result -eq '[FAIL] Verification: Run policy mismatch') 'registration success with invalid persisted definition is distinguished from COM failure'
+    $healthRows = @(Get-TaskHealthRows $config)
+    Assert ($healthRows[0].Value -eq '[FAIL] Run policy mismatch') 'diagnostics show mismatched task setting without requiring a repair attempt'
     function Get-TaskService { throw [Runtime.InteropServices.COMException]::new('SECRET-FIXTURE-TASK',-2147024891) }
     $repairResults = @(Repair-ManagerTasks $config)
     Assert ($repairResults.Count -eq 3 -and $repairResults[0].Result -eq '[FAIL] Task Scheduler connection failed (0x80070005; access denied)') 'task connection failure exposes safe native diagnostic'
+    $healthRows = @(Get-TaskHealthRows $config)
+    Assert ($healthRows.Count -eq 3 -and $healthRows[0].Value -eq $repairResults[0].Result) 'diagnostics show Task Scheduler connection HRESULT'
+    function New-AclRuleFixture([string]$Sid, [string]$Type = 'Allow', [string]$Rights = 'FullControl', [string]$Propagation = 'None') {
+        return [pscustomobject]@{IdentityReference=[pscustomobject]@{Value=$Sid};
+            AccessControlType=[Security.AccessControl.AccessControlType]$Type;
+            FileSystemRights=[Security.AccessControl.FileSystemRights]$Rights;
+            PropagationFlags=[Security.AccessControl.PropagationFlags]$Propagation}
+    }
+    function New-AclFixture {
+        $fixture = [pscustomobject]@{AreAccessRulesProtected=$true;Rules=@(
+            (New-AclRuleFixture 'S-1-5-18'),(New-AclRuleFixture 'S-1-5-32-544'))}
+        $fixture | Add-Member -MemberType ScriptMethod -Name GetAccessRules -Value { param($explicit,$inherited,$identityType) return $this.Rules }
+        return $fixture
+    }
+    $aclFixture = New-AclFixture; $aclFailure = $null
+    Assert (Test-TrustedRuntimeAcl $aclFixture ([ref]$aclFailure)) 'protected SYSTEM and Administrators full control accepted'
+    $aclFixture.AreAccessRulesProtected = $false
+    Assert (-not (Test-TrustedRuntimeAcl $aclFixture ([ref]$aclFailure)) -and $aclFailure -eq 'Inheritance enabled') 'ACL inheritance has a distinct diagnostic'
+    $aclFixture = New-AclFixture; $aclFixture.Rules += New-AclRuleFixture 'S-1-5-11'
+    Assert (-not (Test-TrustedRuntimeAcl $aclFixture ([ref]$aclFailure)) -and $aclFailure -eq 'Unexpected allow rule') 'unexpected allowed principal detected'
+    $aclFixture = New-AclFixture; $aclFixture.Rules += New-AclRuleFixture 'S-1-5-18' 'Deny' 'Read'
+    Assert (-not (Test-TrustedRuntimeAcl $aclFixture ([ref]$aclFailure)) -and $aclFailure -eq 'Trusted account denied') 'deny rule for SYSTEM cannot be reported healthy'
+    $aclFixture = New-AclFixture; $aclFixture.Rules[0].FileSystemRights = [Security.AccessControl.FileSystemRights]::Read
+    Assert (-not (Test-TrustedRuntimeAcl $aclFixture ([ref]$aclFailure)) -and $aclFailure -eq 'Incomplete trusted permissions') 'incomplete trusted access detected'
+    $aclFixture = New-AclFixture; $aclFixture.Rules = @($aclFixture.Rules[0])
+    Assert (-not (Test-TrustedRuntimeAcl $aclFixture ([ref]$aclFailure)) -and $aclFailure -eq 'Missing SYSTEM/Administrators access') 'missing Administrators access detected'
+    $aclFixture = New-AclFixture; $aclFixture.Rules[0].PropagationFlags = [Security.AccessControl.PropagationFlags]::InheritOnly
+    Assert (-not (Test-TrustedRuntimeAcl $aclFixture ([ref]$aclFailure)) -and $aclFailure -eq 'Incomplete trusted permissions') 'inherit-only ACL entry is not full access to the runtime item'
+    function Get-Acl {
+        param($LiteralPath)
+        if ($script:failAclRead) { throw [UnauthorizedAccessException]::new('SECRET-FIXTURE-ACL') }
+        $fixture = New-AclFixture
+        if ($LiteralPath -eq $TokenPath) { $fixture.AreAccessRulesProtected = $false }
+        return $fixture
+    }
+    Assert (-not (Test-RuntimeAcl ([ref]$aclFailure)) -and $aclFailure -eq 'Protected token: Inheritance enabled') 'runtime ACL diagnostic identifies the protected item'
+    $script:failAclRead = $true
+    Assert (-not (Test-RuntimeAcl ([ref]$aclFailure)) -and $aclFailure -eq 'Runtime directory ACL read failed (0x80070005; access denied)') 'ACL read failure is distinct from unexpected access and hides exception text'
     # A recent failed check must not be debounced; skips must not write status.
     function Read-Config { return $script:config }
     function Complete-Check($Config,$State,$Reason) { $script:checkCalls++; return [pscustomobject]@{Lines=@();ExitCode=0} }

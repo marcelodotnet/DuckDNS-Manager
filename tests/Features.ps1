@@ -303,6 +303,64 @@ try {
     Assert ($endpoint.Address.ToString() -eq '192.168.2.40' -and $endpoint.Port -eq 0) 'compiled native delegate returns chosen IPv4 with ephemeral port'
     Assert-Throws { [void]$binding.Bind($null,[Net.IPEndPoint]::new([Net.IPAddress]::IPv6Loopback,443),0) } 'compiled delegate rejects IPv6 remote endpoints'
     Assert-Throws { [void]$binding.Bind($null,[Net.IPEndPoint]::new([Net.IPAddress]::Parse('8.8.8.8'),443),3) } 'compiled delegate bounds repeated bind failures'
+    $config = Read-Config
+    $config.NetworkInterface.Mode = 'Specific'; $config.NetworkInterface.InterfaceGuid = $guidA
+    $config.Dns.Mode = 'System'; $config.Dns.ManualServer = $null
+    $script:interfaces = $savedInterfaces
+    $script:openingDnsCalls = 0; $script:openingDnsIP = '8.8.8.8'
+    function Resolve-HostA($Config,$Retry) {
+        $script:openingDnsCalls++
+        $addresses = @($script:openingDnsIP)
+        if ($script:openingNoA) { $addresses = @() }
+        return [pscustomobject]@{Success=(-not $script:openingDnsFailure);Addresses=$addresses;Resolver='Windows';IsFallback=$false}
+    }
+    $stateBeforeOpening = [IO.File]::ReadAllText($StatusPath)
+    $tokenBeforeOpening = [Convert]::ToBase64String([IO.File]::ReadAllBytes($TokenPath))
+    $apiCallsBeforeOpening = $script:apiCalls
+    $autoCallsBeforeOpening = $script:autoCalls; $boundCallsBeforeOpening = $script:boundCalls.Count
+    $script:RunClock = $null
+    $opening = Get-OpeningAddressCheck $config
+    Assert ($opening.Status -eq '[OK] IPs match' -and $opening.PublicIP -eq '8.8.8.8' -and $opening.DuckDnsIP -eq '8.8.8.8') 'opening check reads current public and DuckDNS IPv4'
+    Assert ($script:boundCalls.Count -eq ($boundCallsBeforeOpening + 1) -and $script:autoCalls -eq $autoCallsBeforeOpening -and $script:openingDnsCalls -eq 1) 'opening check respects Specific binding and selected DNS path'
+    Assert ($script:apiCalls -eq $apiCallsBeforeOpening -and [IO.File]::ReadAllText($StatusPath) -ceq $stateBeforeOpening -and
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($TokenPath)) -eq $tokenBeforeOpening) 'opening address queries preserve update history and credentials without API calls'
+    Assert ($null -eq $script:RunClock -and $opening.CheckedUtc) 'opening check records its observation time and releases its budget'
+    $script:openingDnsIP = '8.8.4.4'
+    $opening = Get-OpeningAddressCheck $config
+    Assert ($opening.Status -eq '[WARN] IPs differ' -and $opening.DuckDnsIP -eq '8.8.4.4') 'opening check exposes current DNS mismatch rather than saved address'
+    $script:openingDnsFailure = $true
+    $opening = Get-OpeningAddressCheck $config
+    Assert ($opening.Status -eq '[FAIL] DNS resolution failed' -and $opening.DuckDnsIP -eq '[FAIL] Resolution failed') 'opening DNS failure never presents saved DNS as current'
+    $script:openingDnsFailure = $false; $script:openingNoA = $true
+    $opening = Get-OpeningAddressCheck $config
+    Assert ($opening.Status -eq '[WARN] No A record' -and $opening.DuckDnsIP -eq 'No A record') 'opening check distinguishes a valid empty DNS answer'
+    $script:openingNoA = $false; $script:interfaces = @()
+    $opening = Get-OpeningAddressCheck $config
+    Assert ($opening.PublicIP -eq '[FAIL] Selected interface unavailable' -and $opening.Status -eq '[FAIL] Public IPv4 unavailable' -and
+        $script:autoCalls -eq $autoCallsBeforeOpening) 'opening check has no Automatic fallback when selected interface is unavailable'
+    $script:interfaces = $savedInterfaces; $script:openingDnsIP = '8.8.8.8'
+    $config.CompareIpBeforeUpdate = $false
+    $dnsCallsBefore = $script:openingDnsCalls
+    $opening = Get-OpeningAddressCheck $config
+    Assert ($script:openingDnsCalls -eq ($dnsCallsBefore + 1) -and $opening.Status -eq '[OK] IPs match') 'opening always reads DuckDNS address independently of update comparison setting'
+    $handle = Enter-RunLock
+    try { Save-Config $config } finally { Exit-RunLock $handle }
+    function Test-Elevated { return $true }
+    function Read-Choice { return '0' }
+    $script:realDashboard = ${function:Show-Dashboard}
+    function Show-Dashboard {
+        $script:openingBeforeDashboard = ($null -ne $script:OpeningAddressCheck)
+        & $script:realDashboard
+    }
+    $script:consoleLines = @(); $Scheduled = $false
+    $startCode = Start-Manager
+    Assert ($startCode -eq 0 -and $script:openingBeforeDashboard) 'interactive startup queries addresses before displaying its first dashboard'
+    Assert (($script:consoleLines -join '|') -match '\[OK\] IPs match' -and ($script:consoleLines -join '|') -match '8\.8\.8\.8') 'dashboard shows fresh opening result'
+    Assert ($script:apiCalls -eq $apiCallsBeforeOpening) 'interactive opening does not send a credential validation or DNS update'
+    $script:OpeningAddressCheck = $null; $Scheduled = $true
+    function Run-Update($RunReason,$Interactive) { $script:scheduledReason = $RunReason; return 0 }
+    Assert ((Start-Manager) -eq 0 -and $null -eq $script:OpeningAddressCheck -and $script:scheduledReason -eq $Reason) 'scheduled entry uses existing update flow without an opening dashboard check'
+    $Scheduled = $false
     Write-Output ("All $passed feature assertions passed. Live Windows binding/DPAPI/ACL/COM remains untested.")
 } finally {
     $env:ProgramData = $priorProgramData
