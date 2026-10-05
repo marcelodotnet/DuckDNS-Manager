@@ -10,13 +10,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$ScriptVersion = '1.2.1'
+$ScriptVersion = '1.3.0'
 $Root = Join-Path $env:ProgramData 'DuckDNS'
 $InstalledScript = Join-Path $Root 'DuckDNS-Manager.ps1'
 $ConfigPath = Join-Path $Root 'config.json'
 $PreviousConfigPath = Join-Path $Root 'config.previous.json'
 $script:RunLockHeld = $false
 $script:RunClock = $null
+$script:OpeningAddressCheck = $null
 $InternalLimitSeconds = 240
 $ManualFallbacks = @('1.1.1.1', '8.8.8.8')
 $TokenPath = Join-Path $Root 'token.dat'
@@ -930,7 +931,11 @@ function Invoke-DuckDnsApi($Config, [string]$PublicIP, [bool]$SingleAttempt = $f
             try {
                 $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
                 Assert-Deadline
-                $lines = @(([string]$response.Content -replace "`r", '').Trim() -split "`n")
+                # Windows PowerShell may return bytes when Content-Type is absent.
+                $body = $response.Content
+                if ($body -is [byte[]]) { $body = [Text.Encoding]::UTF8.GetString($body) }
+                $body = ([string]$body).Trim().TrimStart([char]0xFEFF).Trim()
+                $lines = @($body -split '\r\n|\n|\r')
                 if ($lines.Count -and $lines[0].Trim() -eq 'KO') { return [pscustomobject]@{ Kind = 'Rejected'; Status = 'Rejected'; TokenIdentity = $tokenIdentity } }
                 if ($lines.Count -and $lines[0].Trim() -eq 'OK') {
                     $status = 'Updated'
@@ -1116,6 +1121,7 @@ function Invoke-CheckFlow($Config, $State, [string]$RunReason, [bool]$SingleAtte
 }
 
 function Complete-Check($Config, $State, [string]$RunReason, [bool]$SingleAttempt = $false) {
+    $script:OpeningAddressCheck = $null
     if ($null -eq $script:RunClock) { Start-Deadline }
     if ($State.Domain -and $State.Domain -cne (Get-DuckDnsDomain $Config)) {
         foreach ($name in @('LastDetectedPublicIPv4','DuckDnsIPv4','LastCheckUtc','LastSuccessfulUpdateUtc','LastSuccessfulCheckUtc','LastReason','LastResult')) { $State.$name = $null }
@@ -1170,6 +1176,18 @@ function Get-ManagerTaskFolder($Service, [bool]$Create) {
 
 function Get-TaskName([string]$Kind) { return ('DuckDNS Manager - ' + $Kind) }
 
+function Resolve-WindowsAccountSid([string]$AccountName) {
+    $account = [Security.Principal.NTAccount]::new($AccountName)
+    return $account.Translate([Security.Principal.SecurityIdentifier]).Value
+}
+
+function Test-SystemTaskPrincipal([string]$UserId) {
+    if ($UserId -in @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18')) { return $true }
+    if ([string]::IsNullOrWhiteSpace($UserId)) { return $false }
+    try { return ((Resolve-WindowsAccountSid $UserId) -eq 'S-1-5-18') }
+    catch { return $false }
+}
+
 function Get-TaskEnabled($Config, [string]$Kind) {
     switch ($Kind) {
         'Startup' { return [bool]$Config.Scheduling.Startup.Enabled }
@@ -1198,7 +1216,7 @@ function Test-NoRepetition($Trigger) {
 function New-ManagerTaskDefinition($Service, $Config, [string]$Kind) {
     $definition = $Service.NewTask(0)
     $definition.RegistrationInfo.Description = 'DuckDNS Manager public IPv4 synchronization (' + $Kind + ').'
-    $definition.Principal.UserId = 'SYSTEM'
+    $definition.Principal.UserId = 'S-1-5-18'
     $definition.Principal.LogonType = 5
     $definition.Principal.RunLevel = 1
     $settings = $definition.Settings
@@ -1316,8 +1334,7 @@ function Test-ManagerTask($Service, $Config, [string]$Kind, [ref]$Failure = ([re
         $task = $folder.GetTask((Get-TaskName $Kind))
         $def = $task.Definition
         $stage = 'Principal'
-        $principal = ([string]$def.Principal.UserId).ToUpperInvariant()
-        if ($principal -notin @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18')) { return $false }
+        if (-not (Test-SystemTaskPrincipal ([string]$def.Principal.UserId))) { return $false }
         if ([int]$def.Principal.LogonType -ne 5 -or [int]$def.Principal.RunLevel -ne 1) { return $false }
         $stage = 'Enabled state'
         if ([bool]$task.Enabled -ne (Get-TaskEnabled $Config $Kind) -or
@@ -1387,7 +1404,7 @@ function Set-ManagerTask($Service, $Config, [string]$Kind) {
         $stage = 'Definition'
         $definition = New-ManagerTaskDefinition $Service $Config $Kind
         $stage = 'Registration'
-        [void]$folder.RegisterTaskDefinition((Get-TaskName $Kind), $definition, 6, 'SYSTEM', $null, 5, $null)
+        [void]$folder.RegisterTaskDefinition((Get-TaskName $Kind), $definition, 6, 'S-1-5-18', $null, 5, $null)
         $stage = 'Verification'
         $failure = $null
         if (-not (Test-ManagerTask $Service $Config $Kind ([ref]$failure))) {
@@ -1430,14 +1447,16 @@ function Get-TaskHealthRows($Config) {
         $service = Get-TaskService
         foreach ($kind in $TaskNames) {
             $message = '[FAIL] Needs repair'
-            if (Test-ManagerTask $service $Config $kind) {
+            $failure = $null
+            if (Test-ManagerTask $service $Config $kind ([ref]$failure)) {
                 $message = '[OK]'
                 if (-not (Get-TaskEnabled $Config $kind)) { $message = '[OFF] Disabled' }
-            }
+            } else { $message = '[FAIL] ' + $failure }
             $rows += New-Line ($kind + ' task') $message
         }
     } catch {
-        foreach ($kind in $TaskNames) { $rows += New-Line ($kind + ' task') '[FAIL] Unavailable' }
+        $failure = Get-SafeTaskFailure $_ 'Task Scheduler connection'
+        foreach ($kind in $TaskNames) { $rows += New-Line ($kind + ' task') ('[FAIL] ' + $failure) }
     }
     return $rows
 }
@@ -1853,26 +1872,51 @@ function Show-Status {
     Wait-Back
 }
 
-function Test-RuntimeAcl {
+function Test-TrustedRuntimeAcl($Acl, [ref]$Failure = ([ref]$null)) {
+    $Failure.Value = $null
+    if (-not $Acl.AreAccessRulesProtected) { $Failure.Value = 'Inheritance enabled'; return $false }
+    $seen = @()
+    foreach ($rule in @($Acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))) {
+        $sid = $rule.IdentityReference.Value
+        if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny) {
+            if ($sid -in @('S-1-5-18','S-1-5-32-544')) { $Failure.Value = 'Trusted account denied'; return $false }
+            continue
+        }
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        if ($sid -notin @('S-1-5-18','S-1-5-32-544')) { $Failure.Value = 'Unexpected allow rule'; return $false }
+        if (($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne
+            [Security.AccessControl.FileSystemRights]::FullControl -or
+            ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) {
+            $Failure.Value = 'Incomplete trusted permissions'; return $false
+        }
+        $seen += $sid
+    }
+    if ('S-1-5-18' -notin $seen -or 'S-1-5-32-544' -notin $seen) {
+        $Failure.Value = 'Missing SYSTEM/Administrators access'; return $false
+    }
+    return $true
+}
+
+function Test-RuntimeAcl([ref]$Failure = ([ref]$null)) {
+    $Failure.Value = $null
+    $stage = 'Runtime directory ACL read'
     try {
         $paths = @($Root, $TokenPath)
         if ([IO.File]::Exists($CredentialReceiptPath)) { $paths += $CredentialReceiptPath }
         foreach ($path in $paths) {
+            $label = 'Runtime directory'
+            if ($path -eq $TokenPath) { $label = 'Protected token' }
+            elseif ($path -eq $CredentialReceiptPath) { $label = 'Verification receipt' }
+            $stage = $label + ' ACL read'
             $acl = Get-Acl -LiteralPath $path
-            if (-not $acl.AreAccessRulesProtected) { return $false }
-            $seen = @()
-            foreach ($rule in @($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))) {
-                if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
-                $sid = $rule.IdentityReference.Value
-                if ($sid -notin @('S-1-5-18','S-1-5-32-544')) { return $false }
-                if (($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne
-                    [Security.AccessControl.FileSystemRights]::FullControl) { return $false }
-                $seen += $sid
+            $detail = $null
+            if (-not (Test-TrustedRuntimeAcl $acl ([ref]$detail))) {
+                $Failure.Value = $label + ': ' + $detail
+                return $false
             }
-            if ('S-1-5-18' -notin $seen -or 'S-1-5-32-544' -notin $seen) { return $false }
         }
         return $true
-    } catch { return $false }
+    } catch { $Failure.Value = Get-SafeTaskFailure $_ $stage; return $false }
 }
 
 function New-SectionRow([string]$Name) { return [pscustomobject]@{ Label = ''; Value = ''; Section = $Name } }
@@ -1886,8 +1930,9 @@ function Get-FullDiagnosticRows($Config) {
     $rows += New-Line 'Credentials' $credentialStatus
     if ($credentialStatus.StartsWith('[FAIL]')) { $overall = '[FAIL]' }
     elseif ($credentialStatus.StartsWith('[WARN]')) { $overall = '[WARN]' }
-    if (Test-RuntimeAcl) { $rows += New-Line 'Runtime ACL' '[OK]' }
-    else { $rows += New-Line 'Runtime ACL' '[FAIL] Unexpected access detected'; $overall = '[FAIL]' }
+    $aclFailure = $null
+    if (Test-RuntimeAcl ([ref]$aclFailure)) { $rows += New-Line 'Runtime ACL' '[OK]' }
+    else { $rows += New-Line 'Runtime ACL' ('[FAIL] ' + $aclFailure); $overall = '[FAIL]' }
     $state = Read-State
     $stateText = '[OK]'
     if ($state.ReadKind -eq 'Missing') { $stateText = '[INFO] No saved state' }
@@ -2271,6 +2316,45 @@ function Install-Manager {
     }
 }
 
+function Get-AddressCheckConfigKey($Config) {
+    return (@($Config.Hostname, $Config.NetworkInterface.Mode, [string]$Config.NetworkInterface.InterfaceGuid,
+        $Config.Dns.Mode, [string]$Config.Dns.ManualServer) -join '|')
+}
+
+function Get-OpeningAddressCheck($Config) {
+    $check = [pscustomobject]@{
+        ConfigKey = (Get-AddressCheckConfigKey $Config)
+        PublicIP = '[FAIL] Unavailable'
+        DuckDnsIP = '[FAIL] Unavailable'
+        Status = '[FAIL] Address check failed'
+        CheckedUtc = $null
+    }
+    $priorClock = $script:RunClock
+    Start-Deadline
+    try {
+        $found = Find-PublicIPv4 $Config
+        if ($found.IP) { $check.PublicIP = [string]$found.IP }
+        elseif ($found.InterfaceUnavailable) { $check.PublicIP = '[FAIL] Selected interface unavailable' }
+        else { $check.PublicIP = '[FAIL] All providers failed' }
+        $dns = Resolve-HostA $Config $false
+        if ($dns.Success) {
+            $check.DuckDnsIP = 'No A record'
+            if ($dns.Addresses.Count) { $check.DuckDnsIP = $dns.Addresses -join ', ' }
+        } else { $check.DuckDnsIP = '[FAIL] Resolution failed' }
+        if (-not $found.IP) { $check.Status = '[FAIL] Public IPv4 unavailable' }
+        elseif (-not $dns.Success) { $check.Status = '[FAIL] DNS resolution failed' }
+        elseif (-not $dns.Addresses.Count) { $check.Status = '[WARN] No A record' }
+        elseif ($dns.Addresses.Count -eq 1 -and $dns.Addresses[0] -eq $found.IP) { $check.Status = '[OK] IPs match' }
+        else { $check.Status = '[WARN] IPs differ' }
+    } catch [TimeoutException] { $check.Status = '[FAIL] Address check timed out' }
+    catch { $check.Status = '[FAIL] Address check failed' }
+    finally {
+        $check.CheckedUtc = [DateTime]::UtcNow.ToString('o')
+        $script:RunClock = $priorClock
+    }
+    return $check
+}
+
 function Show-Dashboard {
     $config = Read-Config
     $state = Read-State
@@ -2278,10 +2362,17 @@ function Show-Dashboard {
     Show-Header ''
     $public = 'Unknown'; if ($state.LastDetectedPublicIPv4) { $public = [string]$state.LastDetectedPublicIPv4 }
     $dns = 'Unknown'; if ($state.DuckDnsIPv4) { $dns = [string]$state.DuckDnsIPv4 }
+    $status = Get-StatusText $state
+    $lastCheck = Format-StateTime $state 'LastCheckUtc' $false
+    $opening = $script:OpeningAddressCheck
+    if ($null -ne $opening -and $opening.ConfigKey -ceq (Get-AddressCheckConfigKey $config)) {
+        $public = $opening.PublicIP; $dns = $opening.DuckDnsIP; $status = $opening.Status
+        $lastCheck = [DateTime]::Parse($opening.CheckedUtc).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')
+    }
     Write-Rows @((New-Line 'Domain' (Get-DuckDnsDomain $config)),
-        (New-Line 'Status' (Get-StatusText $state)),
+        (New-Line 'Status' $status),
         (New-Line 'Public IP' $public), (New-Line 'DuckDNS IP' $dns),
-        (New-Line 'Last check' (Format-StateTime $state 'LastCheckUtc' $false)))
+        (New-Line 'Last check' $lastCheck))
     Show-Section 'AUTOMATION'
     $startup = '[OFF]'; if ($config.Scheduling.Startup.Enabled) { $startup = '[ON] ' + $config.Scheduling.Startup.DelaySeconds + ' s delay' }
     $network = '[OFF]'; if ($config.Scheduling.NetworkReconnect.Enabled) { $network = '[ON]' }
@@ -2379,6 +2470,9 @@ function Start-Manager {
                 return $ExitCodes.Config
             }
         }
+        Show-Header 'OPENING CHECK'
+        Write-Rows @((New-Line 'Address check' '[INFO] Querying public IPv4 and DuckDNS DNS'))
+        $script:OpeningAddressCheck = Get-OpeningAddressCheck (Read-Config)
         while ($true) {
             Show-Dashboard
             $choice = Read-Choice

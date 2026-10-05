@@ -150,6 +150,13 @@ an update to test credentials. Change Token retains the protected token and runs
 a check with at most one API validation attempt, respecting DNS comparison and
 provider consensus.
 
+Each interactive opening queries the public IPv4 through the configured interface
+and the DuckDNS A record through the configured DNS resolver before showing the
+dashboard. It displays fresh addresses and IPs match, IPs differ or a query failure,
+even when update-time DNS comparison is disabled. This read-only check does not
+send an update, verify credentials or change saved update history. Scheduled runs
+keep their existing update flow.
+
 Maintenance repairs tasks, restores defaults while preserving hostname/token,
 opens the runtime folder or Task Scheduler, clears state/logs, and uninstalls.
 Restore Defaults returns DNS to System mode and interface selection to Automatic. Uninstall removes only manager-owned
@@ -162,6 +169,16 @@ Tasks** now reports the failing operation and native HRESULT, or the setting
 group that failed verification. **Update Now** distinguishes API DNS, connection,
 TLS/certificate, timeout and HTTP errors without displaying the token-bearing URL.
 These API failures leave unverified credentials pending and retain the saved token.
+
+Version 1.3.0 adds the opening address check and decodes API response bytes as UTF-8 before inspecting OK/KO. This
+fixes valid replies being reported as Unexpected API response when Windows
+PowerShell receives content without a Content-Type header. Optional UTF-8
+byte-order marks and common line endings are supported; empty/HTML replies
+remain failures without exposing their contents.
+Task registration uses the SYSTEM SID, and validation accepts localized account
+names that resolve to that SID. Task health identifies the failing setting or
+native error. Runtime ACL diagnostics identify the affected item and distinguish
+unexpected access, inheritance, missing permissions and read failures.
 
 Logging is off by default. When enabled, it writes concise sanitized results
 and rotates at roughly 1 MiB with one previous log. Dates are stored in UTC and
@@ -200,11 +217,13 @@ powershell.exe -NoProfile -File .\tests\Features.ps1
 
 The suites use temporary files, synthetic interfaces and mocked Windows/network
 boundaries. They never call the real DuckDNS API. PowerShell 7.4.13/Linux passed
-111 regression and 89 feature assertions (200 total), including parser/ASCII,
+136 regression and 102 feature assertions (238 total), including parser/ASCII,
 migration, atomic writes, locks, state recovery, DNS selection, consensus,
 DHCP/rename/disconnection handling, strict source selection, credential
 transitions, setup/edit lock scope and console flows, timeouts, debounce, fresh
-task-folder creation, native error reporting and sanitized API failures. The production
+task-folder creation, native error reporting, byte-array API response parsing
+sanitized API failures, localized task identities, ACL failure categories and
+read-only opening checks. The production
 C# binding delegate was compiled and invoked directly. Actual Windows source
 binding, DPAPI, ACLs, native DNS and Task Scheduler integration were not executed.
 Windows PowerShell 5.1 compatibility was reviewed statically. No production
